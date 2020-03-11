@@ -1,23 +1,25 @@
 // Copyright 2020 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
+use async_trait::async_trait;
 use cid::{multihash::MultihashDigest, Cid};
-use db::{Error, MemoryDB, Read, RocksDb, Write};
-use encoding::{de::DeserializeOwned, from_slice, ser::Serialize, to_vec};
+use db::{Error, MemoryDB, RocksDb, Store};
+use encoding::{de::DeserializeOwned, from_slice};
 
 /// Wrapper for database to handle inserting and retrieving data from AMT with Cids
-pub trait BlockStore: Read + Write {
+#[async_trait]
+pub trait BlockStore: Store {
     /// Get bytes from block store by Cid
-    fn get_bytes(&self, cid: &Cid) -> Result<Option<Vec<u8>>, Error> {
-        Ok(self.read(cid.to_bytes())?)
+    async fn get_bytes(&self, cid: &Cid) -> Result<Option<Vec<u8>>, Error> {
+        Ok(self.read(cid.to_bytes()).await?)
     }
 
     /// Get typed object from block store by Cid
-    fn get<T>(&self, cid: &Cid) -> Result<Option<T>, Error>
+    async fn get<T>(&self, cid: &Cid) -> Result<Option<T>, Error>
     where
         T: DeserializeOwned,
     {
-        match self.get_bytes(cid)? {
+        match self.get_bytes(cid).await? {
             Some(bz) => Ok(Some(
                 from_slice(&bz).map_err(|e| Error::new(e.to_string()))?,
             )),
@@ -26,14 +28,13 @@ pub trait BlockStore: Read + Write {
     }
 
     /// Put an object in the block store and return the Cid identifier
-    fn put<S, T>(&self, obj: &S, hash: T) -> Result<Cid, Error>
+    async fn put<T>(&self, obj: &[u8], hash: T) -> Result<Cid, Error>
     where
-        S: Serialize,
-        T: MultihashDigest,
+        T: MultihashDigest + Send,
     {
-        let bz = to_vec(obj).map_err(|e| Error::new(e.to_string()))?;
-        let cid = Cid::new_from_cbor(&bz, hash).map_err(|e| Error::new(e.to_string()))?;
-        self.write(cid.to_bytes(), bz)?;
+        let cid = Cid::new_from_cbor(&obj, hash).map_err(|e| Error::new(e.to_string()))?;
+        self.write::<&[u8], &[u8]>(cid.to_bytes().as_ref(), obj.as_ref())
+            .await?;
         Ok(cid)
     }
 }

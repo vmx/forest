@@ -6,6 +6,7 @@ edition = "2018"
 
 [dependencies]
 rocksdb = "0.13.0"
-parking_lot = "0.9.0"
 blocks = { package = "forest_blocks", path = "../../blockchain/blocks"}
 encoding = { package = "forest_encoding", path = "../../encoding"}
+async-std = { version = "1.4.0", features = ["unstable"] }
+async-trait = "0.1.24"

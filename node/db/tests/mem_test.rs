@@ -3,60 +3,79 @@
 
 mod subtests;
 
+use async_std::task;
 use db::MemoryDB;
 
 #[test]
 fn mem_db_open() {
-    let mut db = MemoryDB::default();
-    subtests::open(&mut db);
-    // Calling open on opened db should not error
-    subtests::open(&mut db);
+    task::block_on(async {
+        let mut db = MemoryDB::default();
+        subtests::open(&mut db);
+        // Calling open on opened db should not error
+        subtests::open(&mut db);
+    });
 }
 
 #[test]
 fn mem_db_write() {
-    let db = MemoryDB::default();
-    subtests::write(&db);
+    task::block_on(async {
+        let db = MemoryDB::default();
+        subtests::write(&db).await;
+    });
 }
 
 #[test]
 fn mem_db_read() {
-    let db = MemoryDB::default();
-    subtests::read(&db);
+    task::block_on(async {
+        let db = MemoryDB::default();
+        subtests::read(&db).await;
+    });
 }
 
 #[test]
 fn mem_db_exists() {
-    let db = MemoryDB::default();
-    subtests::exists(&db);
+    task::block_on(async {
+        let db = MemoryDB::default();
+        subtests::exists(&db).await;
+    });
 }
 
 #[test]
 fn mem_db_does_not_exist() {
-    let db = MemoryDB::default();
-    subtests::does_not_exist(&db);
+    task::block_on(async {
+        let db = MemoryDB::default();
+        subtests::does_not_exist(&db).await;
+    });
 }
 
 #[test]
 fn mem_db_delete() {
-    let db = MemoryDB::default();
-    subtests::delete(&db);
+    task::block_on(async {
+        let db = MemoryDB::default();
+        subtests::delete(&db).await;
+    });
 }
 
 #[test]
 fn mem_db_bulk_write() {
-    let db = MemoryDB::default();
-    subtests::bulk_write(&db);
+    task::block_on(async {
+        let db = MemoryDB::default();
+        subtests::bulk_write(&db).await;
+    });
 }
 
 #[test]
 fn mem_db_bulk_read() {
-    let db = MemoryDB::default();
-    subtests::bulk_read(&db);
+    task::block_on(async {
+        let db = MemoryDB::default();
+        subtests::bulk_read(&db).await;
+    });
 }
 
 #[test]
 fn mem_db_bulk_delete() {
-    let db = MemoryDB::default();
-    subtests::bulk_delete(&db);
+    task::block_on(async {
+        let db = MemoryDB::default();
+        subtests::bulk_delete(&db).await;
+    });
 }

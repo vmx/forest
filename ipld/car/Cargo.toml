@@ -13,3 +13,4 @@ serde = { version = "1.0", features = ["derive"] }
 
 [dev-dependencies]
 db = { path = "../../node/db"}
+async-std = { version = "1.4.0", features = ["unstable"] }

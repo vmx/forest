@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0, MIT
 
 use super::Error;
-use super::{DatabaseService, Read, Write};
-use parking_lot::RwLock;
+use super::{DatabaseService, Store};
+use async_std::sync::RwLock;
+use async_trait::async_trait;
 use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::hash::{Hash, Hasher};
 
@@ -14,7 +15,7 @@ pub struct MemoryDB {
 }
 
 impl MemoryDB {
-    fn db_index<K>(key: K) -> u64
+    fn db_index<K>(key: &K) -> u64
     where
         K: AsRef<[u8]>,
     {
@@ -22,12 +23,10 @@ impl MemoryDB {
         key.as_ref().hash::<DefaultHasher>(&mut hasher);
         hasher.finish()
     }
-}
 
-impl Clone for MemoryDB {
-    fn clone(&self) -> Self {
+    async fn clone(&self) -> Self {
         Self {
-            db: RwLock::new(self.db.read().clone()),
+            db: RwLock::new(self.db.read().await.clone()),
         }
     }
 }
@@ -42,72 +41,73 @@ impl Default for MemoryDB {
 
 impl DatabaseService for MemoryDB {}
 
-impl Write for MemoryDB {
-    fn write<K, V>(&self, key: K, value: V) -> Result<(), Error>
+#[async_trait]
+impl Store for MemoryDB {
+    async fn write<K, V>(&self, key: K, value: V) -> Result<(), Error>
     where
-        K: AsRef<[u8]>,
-        V: AsRef<[u8]>,
+        K: AsRef<[u8]> + Send,
+        V: AsRef<[u8]> + Send,
     {
         self.db
             .write()
-            .insert(Self::db_index(key), value.as_ref().to_vec());
+            .await
+            .insert(Self::db_index(&key), value.as_ref().to_vec());
         Ok(())
     }
 
-    fn delete<K>(&self, key: K) -> Result<(), Error>
+    async fn delete<K>(&self, key: K) -> Result<(), Error>
     where
-        K: AsRef<[u8]>,
+        K: AsRef<[u8]> + Send,
     {
-        self.db.write().remove(&Self::db_index(key));
+        self.db.write().await.remove(&Self::db_index(&key));
         Ok(())
     }
 
-    fn bulk_write<K, V>(&self, keys: &[K], values: &[V]) -> Result<(), Error>
+    async fn bulk_write<K, V>(&self, keys: &[K], values: &[V]) -> Result<(), Error>
     where
-        K: AsRef<[u8]>,
-        V: AsRef<[u8]>,
+        K: AsRef<[u8]> + Send + Sync,
+        V: AsRef<[u8]> + Send + Sync,
     {
         for (k, v) in keys.iter().zip(values.iter()) {
             self.db
                 .write()
-                .insert(Self::db_index(k), v.as_ref().to_vec());
+                .await
+                .insert(Self::db_index(&k), v.as_ref().to_vec());
         }
         Ok(())
     }
 
-    fn bulk_delete<K>(&self, keys: &[K]) -> Result<(), Error>
+    async fn bulk_delete<K>(&self, keys: &[K]) -> Result<(), Error>
     where
-        K: AsRef<[u8]>,
+        K: AsRef<[u8]> + Send + Sync,
     {
         for k in keys.iter() {
-            self.db.write().remove(&Self::db_index(k));
+            self.db.write().await.remove(&Self::db_index(&k));
         }
         Ok(())
     }
-}
 
-impl Read for MemoryDB {
-    fn read<K>(&self, key: K) -> Result<Option<Vec<u8>>, Error>
+    async fn read<K>(&self, key: K) -> Result<Option<Vec<u8>>, Error>
     where
-        K: AsRef<[u8]>,
+        K: AsRef<[u8]> + Send,
     {
-        Ok(self.db.read().get(&Self::db_index(key)).cloned())
+        Ok(self.db.read().await.get(&Self::db_index(&key)).cloned())
     }
 
-    fn exists<K>(&self, key: K) -> Result<bool, Error>
+    async fn exists<K>(&self, key: K) -> Result<bool, Error>
     where
-        K: AsRef<[u8]>,
+        K: AsRef<[u8]> + Send,
     {
-        Ok(self.db.read().contains_key(&Self::db_index(key)))
+        Ok(self.db.read().await.contains_key(&Self::db_index(&key)))
     }
 
-    fn bulk_read<K>(&self, keys: &[K]) -> Result<Vec<Option<Vec<u8>>>, Error>
+    async fn bulk_read<K>(&self, keys: &[K]) -> Result<Vec<Option<Vec<u8>>>, Error>
     where
-        K: AsRef<[u8]>,
+        K: AsRef<[u8]> + Send + Sync,
     {
         let mut v = Vec::with_capacity(keys.len());
         for k in keys.iter() {
-            v.push(self.db.read().get(&Self::db_index(k)).cloned())
+            v.push(self.db.read().await.get(&Self::db_index(&k)).cloned())
         }
         Ok(v)
     }

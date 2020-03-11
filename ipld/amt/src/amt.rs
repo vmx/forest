@@ -3,8 +3,9 @@
 
 use crate::{node::Link, nodes_for_height, BitMap, Error, Node, Root, MAX_INDEX, WIDTH};
 use cid::{multihash::Blake2b256, Cid};
-use encoding::{de::DeserializeOwned, ser::Serialize};
+use encoding::{de::DeserializeOwned, ser::Serialize, to_vec};
 use ipld_blockstore::BlockStore;
+use std::sync::Arc;
 
 /// Array Mapped Trie allows for the insertion and persistence of data, serializable to a CID
 ///
@@ -26,22 +27,22 @@ use ipld_blockstore::BlockStore;
 /// let cid = amt.flush().unwrap();
 /// ```
 #[derive(Debug)]
-pub struct AMT<'db, DB, V>
+pub struct AMT<DB, V>
 where
     DB: BlockStore,
     V: Clone,
 {
     root: Root<V>,
-    block_store: &'db DB,
+    block_store: Arc<DB>,
 }
 
-impl<'db, DB, V> AMT<'db, DB, V>
+impl<DB, V> AMT<DB, V>
 where
-    DB: BlockStore,
-    V: Clone + DeserializeOwned + Serialize,
+    DB: BlockStore + Sync,
+    V: Clone + DeserializeOwned + Serialize + Send + Sync,
 {
     /// Constructor for Root AMT node
-    pub fn new(block_store: &'db DB) -> Self {
+    pub fn new(block_store: Arc<DB>) -> Self {
         Self {
             root: Root::default(),
             block_store,
@@ -49,10 +50,11 @@ where
     }
 
     /// Constructs an AMT with a blockstore and a Cid of the root of the AMT
-    pub fn load(block_store: &'db DB, cid: &Cid) -> Result<Self, Error> {
+    pub async fn load(block_store: Arc<DB>, cid: &Cid) -> Result<Self, Error> {
         // Load root bytes from database
         let root: Root<V> = block_store
-            .get(cid)?
+            .get(cid)
+            .await?
             .ok_or_else(|| Error::Db("Root not found in database".to_owned()))?;
 
         Ok(Self { root, block_store })
@@ -69,16 +71,19 @@ where
     }
 
     /// Generates an AMT with block store and array of cbor marshallable objects and returns Cid
-    pub fn new_from_slice(block_store: &'db DB, vals: &[V]) -> Result<Cid, Error> {
+    pub async fn new_from_slice(block_store: Arc<DB>, vals: &[V]) -> Result<Cid, Error> {
         let mut t = Self::new(block_store);
 
-        t.batch_set(vals)?;
+        t.batch_set(vals).await?;
 
-        t.flush()
+        t.flush().await
     }
 
     /// Get value at index of AMT
-    pub fn get(&self, i: u64) -> Result<Option<V>, Error> {
+    pub async fn get(&self, i: u64) -> Result<Option<V>, Error>
+    where
+        V: Send,
+    {
         if i >= MAX_INDEX {
             return Err(Error::OutOfRange(i));
         }
@@ -87,11 +92,17 @@ where
             return Ok(None);
         }
 
-        self.root.node.get(self.block_store, self.height(), i)
+        self.root
+            .node
+            .get(&*self.block_store, self.height(), i)
+            .await
     }
 
     /// Set value at index
-    pub fn set(&mut self, i: u64, val: V) -> Result<(), Error> {
+    pub async fn set(&mut self, i: u64, val: V) -> Result<(), Error>
+    where
+        V: Send,
+    {
         if i >= MAX_INDEX {
             return Err(Error::OutOfRange(i));
         }
@@ -100,10 +111,13 @@ where
             // node at index exists
             if !self.root.node.empty() {
                 // Save and get cid to be able to link from higher level node
-                self.root.node.flush(self.block_store)?;
+                self.root.node.flush(&*self.block_store).await?;
 
                 // Get cid from storing root node
-                let cid = self.block_store.put(&self.root.node, Blake2b256)?;
+                let cid = self
+                    .block_store
+                    .put(&to_vec(&self.root.node)?, Blake2b256)
+                    .await?;
 
                 // Set links node with first index as cid
                 let mut new_links: [Option<Link<V>>; WIDTH] = Default::default();
@@ -127,7 +141,8 @@ where
         if self
             .root
             .node
-            .set(self.block_store, self.height(), i, val)?
+            .set(&*self.block_store, self.height(), i, val)
+            .await?
         {
             self.root.count += 1;
         }
@@ -137,16 +152,19 @@ where
 
     /// Batch set (naive for now)
     // TODO Implement more efficient batch set to not have to traverse tree and keep cache for each
-    pub fn batch_set(&mut self, vals: &[V]) -> Result<(), Error> {
+    pub async fn batch_set(&mut self, vals: &[V]) -> Result<(), Error>
+    where
+        V: Send,
+    {
         for (i, val) in vals.iter().enumerate() {
-            self.set(i as u64, val.clone())?;
+            self.set(i as u64, val.clone()).await?;
         }
 
         Ok(())
     }
 
     /// Delete item from AMT at index
-    pub fn delete(&mut self, i: u64) -> Result<bool, Error> {
+    pub async fn delete(&mut self, i: u64) -> Result<bool, Error> {
         if i >= MAX_INDEX {
             return Err(Error::OutOfRange(i));
         }
@@ -157,7 +175,12 @@ where
         }
 
         // Delete node from AMT
-        if !self.root.node.delete(self.block_store, self.height(), i)? {
+        if !self
+            .root
+            .node
+            .delete(&*self.block_store, self.height(), i)
+            .await?
+        {
             return Ok(false);
         }
 
@@ -168,7 +191,7 @@ where
             let sub_node: Node<V> = match &self.root.node {
                 Node::Link { links, .. } => match &links[0] {
                     Some(Link::Cached(node)) => *node.clone(),
-                    Some(Link::Cid(cid)) => self.block_store.get(cid)?.ok_or_else(|| {
+                    Some(Link::Cid(cid)) => self.block_store.get(cid).await?.ok_or_else(|| {
                         Error::Cid("Cid did not match any in database".to_owned())
                     })?,
                     _ => unreachable!("Link index should match bitmap"),
@@ -184,8 +207,11 @@ where
     }
 
     /// flush root and return Cid used as key in block store
-    pub fn flush(&mut self) -> Result<Cid, Error> {
-        self.root.node.flush(self.block_store)?;
-        Ok(self.block_store.put(&self.root, Blake2b256)?)
+    pub async fn flush(&mut self) -> Result<Cid, Error> {
+        self.root.node.flush(&*self.block_store).await?;
+        Ok(self
+            .block_store
+            .put(&to_vec(&self.root)?, Blake2b256)
+            .await?)
     }
 }

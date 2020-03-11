@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0, MIT
 
 use super::errors::Error;
-use super::{DatabaseService, Read, Write};
+use super::{DatabaseService, Store};
+use async_trait::async_trait;
 use rocksdb::{Options, WriteBatch, DB};
 use std::env::temp_dir;
 use std::path::{Path, PathBuf};
@@ -69,26 +70,27 @@ impl DatabaseService for RocksDb {
     }
 }
 
-impl Write for RocksDb {
-    fn write<K, V>(&self, key: K, value: V) -> Result<(), Error>
+#[async_trait]
+impl Store for RocksDb {
+    async fn write<K, V>(&self, key: K, value: V) -> Result<(), Error>
     where
-        K: AsRef<[u8]>,
-        V: AsRef<[u8]>,
+        K: AsRef<[u8]> + Send,
+        V: AsRef<[u8]> + Send,
     {
         Ok(self.db()?.put(key, value)?)
     }
 
-    fn delete<K>(&self, key: K) -> Result<(), Error>
+    async fn delete<K>(&self, key: K) -> Result<(), Error>
     where
-        K: AsRef<[u8]>,
+        K: AsRef<[u8]> + Send,
     {
         Ok(self.db()?.delete(key)?)
     }
 
-    fn bulk_write<K, V>(&self, keys: &[K], values: &[V]) -> Result<(), Error>
+    async fn bulk_write<K, V>(&self, keys: &[K], values: &[V]) -> Result<(), Error>
     where
-        K: AsRef<[u8]>,
-        V: AsRef<[u8]>,
+        K: AsRef<[u8]> + Send + Sync,
+        V: AsRef<[u8]> + Send + Sync,
     {
         let mut batch = WriteBatch::default();
         for (k, v) in keys.iter().zip(values.iter()) {
@@ -97,28 +99,26 @@ impl Write for RocksDb {
         Ok(self.db()?.write(batch)?)
     }
 
-    fn bulk_delete<K>(&self, keys: &[K]) -> Result<(), Error>
+    async fn bulk_delete<K>(&self, keys: &[K]) -> Result<(), Error>
     where
-        K: AsRef<[u8]>,
+        K: AsRef<[u8]> + Send + Sync,
     {
         for k in keys.iter() {
             self.db()?.delete(k)?;
         }
         Ok(())
     }
-}
 
-impl Read for RocksDb {
-    fn read<K>(&self, key: K) -> Result<Option<Vec<u8>>, Error>
+    async fn read<K>(&self, key: K) -> Result<Option<Vec<u8>>, Error>
     where
-        K: AsRef<[u8]>,
+        K: AsRef<[u8]> + Send,
     {
         self.db()?.get(key).map_err(Error::from)
     }
 
-    fn exists<K>(&self, key: K) -> Result<bool, Error>
+    async fn exists<K>(&self, key: K) -> Result<bool, Error>
     where
-        K: AsRef<[u8]>,
+        K: AsRef<[u8]> + Send,
     {
         self.db()?
             .get_pinned(key)
@@ -126,9 +126,9 @@ impl Read for RocksDb {
             .map_err(Error::from)
     }
 
-    fn bulk_read<K>(&self, keys: &[K]) -> Result<Vec<Option<Vec<u8>>>, Error>
+    async fn bulk_read<K>(&self, keys: &[K]) -> Result<Vec<Option<Vec<u8>>>, Error>
     where
-        K: AsRef<[u8]>,
+        K: AsRef<[u8]> + Send + Sync,
     {
         let mut v = Vec::with_capacity(keys.len());
         for k in keys.iter() {

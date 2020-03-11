@@ -6,7 +6,9 @@ use cid::{multihash::Blake2b256, Cid};
 use encoding::{
     de::{self, Deserialize, DeserializeOwned},
     ser::{self, Serialize},
+    to_vec,
 };
+use futures::future::{BoxFuture, FutureExt};
 use ipld_blockstore::BlockStore;
 
 /// This represents a link to another Node
@@ -139,26 +141,32 @@ where
 
 impl<V> Node<V>
 where
-    V: Clone + DeserializeOwned + Serialize,
+    V: Clone + DeserializeOwned + Serialize + Send + Sync,
 {
     /// Flushes cache for node, replacing any cached values with a Cid variant
-    pub(super) fn flush<DB: BlockStore>(&mut self, bs: &DB) -> Result<(), Error> {
-        if let Node::Link { links, .. } = self {
-            for link in &mut links.iter_mut() {
-                if let Some(Link::Cached(n)) = link {
-                    // flush sub node to clear caches
-                    n.flush(bs)?;
+    pub(super) fn flush<DB>(&mut self, bs: &DB) -> BoxFuture<'static, Result<(), Error>>
+    where
+        DB: BlockStore + Sync,
+    {
+        async move {
+            if let Node::Link { links, .. } = self {
+                for link in &mut links.iter_mut() {
+                    if let Some(Link::Cached(n)) = link {
+                        // flush sub node to clear caches
+                        n.flush(bs).await?;
 
-                    // Puts node in blockstore and and retrieves it's CID
-                    let cid = bs.put(n, Blake2b256)?;
+                        // Puts node in blockstore and and retrieves it's CID
+                        let cid = bs.put(&to_vec(&n)?, Blake2b256).await?;
 
-                    // Turn cached node into a Cid link
-                    *link = Some(Link::Cid(cid));
+                        // Turn cached node into a Cid link
+                        *link = Some(Link::Cid(cid));
+                    }
                 }
             }
-        }
 
-        Ok(())
+            Ok(())
+        }
+        .boxed()
     }
 
     pub(super) fn bitmap(&self) -> &BitMap {
@@ -174,43 +182,54 @@ where
     }
 
     /// Gets value at given index of AMT given height
-    pub(super) fn get<DB: BlockStore>(
+    pub(super) fn get<DB>(
         &self,
         bs: &DB,
         height: u32,
         i: u64,
-    ) -> Result<Option<V>, Error> {
-        let sub_i = i / nodes_for_height(height);
-        if !self.bitmap().get_bit(sub_i) {
-            return Ok(None);
-        }
+    ) -> BoxFuture<'static, Result<Option<V>, Error>>
+    where
+        DB: BlockStore + Sync,
+    {
+        async move {
+            let sub_i = i / nodes_for_height(height);
+            if !self.bitmap().get_bit(sub_i) {
+                return Ok(None);
+            }
 
-        match self {
-            Node::Leaf { vals, .. } => Ok(vals[i as usize].clone()),
-            Node::Link { links, .. } => match &links[sub_i as usize] {
-                Some(Link::Cid(cid)) => {
-                    // TODO after benchmarking check if cache should be updated from get
-                    let node: Node<V> = bs.get::<Node<V>>(cid)?.ok_or_else(|| {
-                        Error::Cid("Cid did not match any in database".to_owned())
-                    })?;
+            match self {
+                Node::Leaf { vals, .. } => Ok(vals[i as usize].clone()),
+                Node::Link { links, .. } => match &links[sub_i as usize] {
+                    Some(Link::Cid(cid)) => {
+                        // TODO after benchmarking check if cache should be updated from get
+                        let node: Node<V> = bs.get::<Node<V>>(cid).await?.ok_or_else(|| {
+                            Error::Cid("Cid did not match any in database".to_owned())
+                        })?;
 
-                    // Get from node pulled into memory from Cid
-                    node.get(bs, height - 1, i % nodes_for_height(height))
-                }
-                Some(Link::Cached(n)) => n.get(bs, height - 1, i % nodes_for_height(height)),
-                None => Ok(None),
-            },
+                        // Get from node pulled into memory from Cid
+                        node.get(bs, height - 1, i % nodes_for_height(height)).await
+                    }
+                    Some(Link::Cached(n)) => {
+                        n.get(bs, height - 1, i % nodes_for_height(height)).await
+                    }
+                    None => Ok(None),
+                },
+            }
         }
+        .boxed()
     }
 
     /// Set value in node
-    pub(super) fn set<DB: BlockStore>(
+    pub(super) async fn set<DB: BlockStore>(
         &mut self,
         bs: &DB,
         height: u32,
         i: u64,
         val: V,
-    ) -> Result<bool, Error> {
+    ) -> Result<bool, Error>
+    where
+        DB: Sync,
+    {
         if height == 0 {
             return Ok(self.set_leaf(i, val));
         }
@@ -224,7 +243,7 @@ where
         if let Node::Link { links, bmap } = self {
             links[idx] = match &mut links[idx] {
                 Some(Link::Cid(cid)) => {
-                    let node = bs.get::<Node<V>>(cid)?.ok_or_else(|| {
+                    let node = bs.get::<Node<V>>(cid).await?.ok_or_else(|| {
                         Error::Cid("Cid did not match any in database".to_owned())
                     })?;
 
@@ -244,11 +263,11 @@ where
                     bmap.set_bit(idx as u64);
                     Some(Link::Cached(Box::new(node)))
                 }
-                Some(Link::Cached(node)) => return node.set(bs, height - 1, i % nfh, val),
+                Some(Link::Cached(node)) => return node.set(bs, height - 1, i % nfh, val).await,
             };
 
             if let Some(Link::Cached(n)) = &mut links[idx] {
-                n.set(bs, height - 1, i % nfh, val)
+                n.set(bs, height - 1, i % nfh, val).await
             } else {
                 unreachable!("Value is set as cached")
             }
@@ -271,7 +290,7 @@ where
     }
 
     /// Delete value in AMT by index
-    pub(super) fn delete<DB: BlockStore>(
+    pub(super) async fn delete<DB: BlockStore>(
         &mut self,
         bs: &DB,
         height: u32,
@@ -298,7 +317,7 @@ where
             Self::Link { links, bmap } => {
                 let mut sub_node: Node<V> = match &links[sub_i as usize] {
                     Some(Link::Cached(n)) => *n.clone(),
-                    Some(Link::Cid(cid)) => bs.get(cid)?.ok_or_else(|| {
+                    Some(Link::Cid(cid)) => bs.get(cid).await?.ok_or_else(|| {
                         Error::Cid("Cid did not match any in database".to_owned())
                     })?,
                     None => unreachable!("Bitmap value for index is set"),
