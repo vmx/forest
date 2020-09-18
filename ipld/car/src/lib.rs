@@ -4,12 +4,17 @@
 mod error;
 mod util;
 
+use async_std::{
+    fs::{self, File},
+    io::{copy, BufRead, BufWriter, Read},
+    sync::{channel, Arc},
+    task,
+};
 use blockstore::BlockStore;
 use cid::Cid;
 use error::*;
 use forest_encoding::from_slice;
 use serde::{Deserialize, Serialize};
-use std::io::Read;
 use util::{ld_read, read_node};
 
 /// CAR file header
@@ -37,8 +42,9 @@ where
     R: Read,
 {
     /// Creates a new CarReader and parses the CarHeader
-    pub fn new(mut reader: R) -> Result<Self, Error> {
-        let buf = ld_read(&mut reader)?
+    pub async fn new(mut reader: R) -> Result<Self, Error> {
+        let buf = ld_read(&mut reader)
+            .await?
             .ok_or_else(|| Error::ParsingError("failed to parse uvarint for header".to_string()))?;
         let header: CarHeader = from_slice(&buf).map_err(|e| Error::ParsingError(e.to_string()))?;
         if header.roots.is_empty() {
@@ -51,9 +57,11 @@ where
     }
 
     /// Returns the next IPLD Block in the buffer
-    pub fn next_block(&mut self) -> Result<Option<Block>, Error> {
+    pub async fn next_block(&mut self) -> Result<Option<Block>, Error> {
         // Read node -> cid, bytes
-        let block = read_node(&mut self.reader)?.map(|(cid, data)| Block { cid, data });
+        let block = read_node(&mut self.reader)
+            .await?
+            .map(|(cid, data)| Block { cid, data });
         Ok(block)
     }
 }
@@ -66,12 +74,12 @@ pub struct Block {
 }
 
 /// Loads a CAR buffer into a BlockStore
-pub fn load_car<R: Read, B: BlockStore>(s: &B, reader: R) -> Result<Vec<Cid>, Error> {
-    let mut car_reader = CarReader::new(reader)?;
+pub async fn load_car<R: Read, B: BlockStore>(s: &B, reader: R) -> Result<Vec<Cid>, Error> {
+    let mut car_reader = CarReader::new(reader).await?;
 
     // Batch write key value pairs from car file
     let mut buf: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(100);
-    while let Some(block) = car_reader.next_block()? {
+    while let Some(block) = car_reader.next_block().await? {
         buf.push((block.cid.to_bytes(), block.data));
         if buf.len() > 1000 {
             s.bulk_write(&buf)

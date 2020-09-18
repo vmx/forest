@@ -3,19 +3,22 @@
 
 use super::error::Error;
 use cid::Cid;
-use std::io::Read;
-use unsigned_varint::io::ReadError;
+use futures_util::io::AsyncRead;
+use futures_util::{stream::Stream, StreamExt};
+use integer_encoding::VarIntAsyncReader;
+use std::io;
 
-pub(crate) fn ld_read<R: Read>(mut reader: &mut R) -> Result<Option<Vec<u8>>, Error> {
-    let l = match unsigned_varint::io::read_u64(&mut reader) {
+pub(crate) async fn ld_read<R>(mut reader: &mut R) -> Result<Option<Vec<u8>>, io::Error>
+where
+    R: AsyncRead + Unpin + Send + StreamExt,
+{
+    let l = match reader.read_varint_async().await {
         Ok(len) => len,
         Err(e) => {
-            if let ReadError::Io(ioe) = &e {
-                if ioe.kind() == std::io::ErrorKind::UnexpectedEof {
-                    return Ok(None);
-                }
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                return Ok(None);
             }
-            return Err(Error::Other(e.to_string()));
+            return Err(e);
         }
     };
     let mut buf = Vec::with_capacity(l as usize);
@@ -26,8 +29,13 @@ pub(crate) fn ld_read<R: Read>(mut reader: &mut R) -> Result<Option<Vec<u8>>, Er
     Ok(Some(buf))
 }
 
-pub(crate) fn read_node<R: Read>(buf_reader: &mut R) -> Result<Option<(Cid, Vec<u8>)>, Error> {
-    match ld_read(buf_reader)? {
+pub(crate) async fn read_node<R: AsyncRead>(
+    buf_reader: &mut R,
+) -> Result<Option<(Cid, Vec<u8>)>, io::Error>
+where
+    R: AsyncRead + Unpin + Send,
+{
+    match ld_read(buf_reader).await? {
         Some(buf) => {
             let (c, n) = read_cid(&buf)?;
             Ok(Some((c, buf[(n as usize)..].to_owned())))
@@ -36,7 +44,7 @@ pub(crate) fn read_node<R: Read>(buf_reader: &mut R) -> Result<Option<(Cid, Vec<
     }
 }
 
-pub(crate) fn read_cid(buf: &[u8]) -> Result<(Cid, u64), Error> {
+pub(crate) fn read_cid(buf: &[u8]) -> Result<(Cid, u64), io::Error> {
     // TODO: Upgrade the Cid crate to read_cid using a BufReader
     let (version, buf) =
         unsigned_varint::decode::u64(buf).map_err(|e| Error::ParsingError(e.to_string()))?;

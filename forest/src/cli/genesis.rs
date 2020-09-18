@@ -1,6 +1,12 @@
 // Copyright 2020 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
+use async_std::{
+    fs::{self, File},
+    io::{copy, BufRead, BufWriter, Read},
+    sync::{channel, Arc},
+    task,
+};
 use blocks::BlockHeader;
 use blocks::Tipset;
 use chain::ChainStore;
@@ -10,7 +16,6 @@ use ipld_blockstore::BlockStore;
 use log::{debug, info};
 use state_manager::StateManager;
 use std::error::Error as StdError;
-use std::fs::File;
 use std::include_bytes;
 use std::io::BufReader;
 use std::sync::Arc;
@@ -52,11 +57,11 @@ where
 }
 
 fn process_car<R, BS>(
-    reader: BufReader<R>,
+    reader: R,
     chain_store: &mut ChainStore<BS>,
 ) -> Result<BlockHeader, Box<dyn StdError>>
 where
-    R: std::io::Read,
+    R: Read,
     BS: BlockStore,
 {
     // Load genesis state into the database and get the Cid
