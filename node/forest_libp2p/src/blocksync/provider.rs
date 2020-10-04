@@ -7,7 +7,7 @@ use forest_cid::Cid;
 use forest_encoding::tuple::*;
 use ipld_blockstore::BlockStore;
 use log::debug;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::sync::Arc;
@@ -40,21 +40,63 @@ impl BlockSyncRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum BlockSyncResponseStatus {
     // All is well.
-    Success = 1,
+    Success,
     // We could not fetch all blocks requested (but at least we returned
     // the `Head` requested). Not considered an error.
-    PartialResponse = 101,
+    PartialResponse,
     // Request.Start not found.
-    BlockNotFound = 201,
+    BlockNotFound,
     // Requester is making too many requests.
-    GoAway = 202,
+    GoAway,
     // Internal error occured.
-    InternalError = 203,
+    InternalError,
     // Request was bad
-    BadRequest = 204,
+    BadRequest,
+    /// Other undefined response code.
+    Other(i32),
+}
+
+impl Serialize for BlockSyncResponseStatus {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use BlockSyncResponseStatus::*;
+        let code: i32 = match self {
+            Success => 1,
+            PartialResponse => 101,
+            BlockNotFound => 201,
+            GoAway => 202,
+            InternalError => 203,
+            BadRequest => 204,
+            Other(i) => *i,
+        };
+        code.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for BlockSyncResponseStatus {
+    fn deserialize<D>(deserializer: D) -> Result<Self, <D as Deserializer<'de>>::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let code: i32 = Deserialize::deserialize(deserializer)?;
+
+        use BlockSyncResponseStatus::*;
+        let status = match code {
+            x if x == 1 => Success,
+            x if x == 101 => PartialResponse,
+            x if x == 201 => BlockNotFound,
+            x if x == 202 => GoAway,
+            x if x == 203 => InternalError,
+            x if x == 204 => BadRequest,
+            x => Other(x),
+        };
+        Ok(status)
+    }
 }
 
 /// The response to a BlockSync request.
