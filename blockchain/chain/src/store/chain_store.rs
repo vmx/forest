@@ -538,7 +538,7 @@ where
         .map(|c| {
             db.get(c)
                 .map_err(|e| Error::Other(e.to_string()))?
-                .ok_or_else(|| Error::NotFound("Key for header"))
+                .ok_or(Error::NotFound("Key for header"))
         })
         .collect::<Result<_, Error>>()?;
 

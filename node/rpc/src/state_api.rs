@@ -342,8 +342,8 @@ pub(crate) async fn state_wait_msg<
         confidence,
     )
     .await?;
-    let tipset = tipset.ok_or_else(|| "wait for msg returned empty tuple")?;
-    let receipt = receipt.ok_or_else(|| "wait for msg returned empty receipt")?;
+    let tipset = tipset.ok_or("wait for msg returned empty tuple")?;
+    let receipt = receipt.ok_or("wait for msg returned empty receipt")?;
     let tipset: &Tipset = &*tipset;
     let tipset_json: TipsetJson = tipset.clone().into();
     Ok(MessageLookup {

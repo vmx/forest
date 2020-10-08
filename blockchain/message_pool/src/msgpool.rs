@@ -532,7 +532,7 @@ where
             out.append(
                 self.pending_for(&addr)
                     .await
-                    .ok_or_else(|| Error::InvalidFromAddr)?
+                    .ok_or(Error::InvalidFromAddr)?
                     .as_mut(),
             )
         }

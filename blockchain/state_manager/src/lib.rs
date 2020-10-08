@@ -533,7 +533,7 @@ where
                 None
             })
             .next()
-            .unwrap_or_else(|| Ok(None))
+            .unwrap_or(Ok(None))
     }
     fn search_back_for_message(
         block_store: Arc<DB>,

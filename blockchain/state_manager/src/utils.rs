@@ -87,7 +87,7 @@ where
             .map(|n| {
                 let sid = sectors
                     .get(*n as usize)
-                    .ok_or_else(|| "id from challenge does not exist in sectors")?;
+                    .ok_or("id from challenge does not exist in sectors")?;
                 let s_info = sectors_amt
                     .get(*sid)
                     .map_err(|e| format!("failed to get sector {}: {}", sid, e))?
