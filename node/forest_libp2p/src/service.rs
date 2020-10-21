@@ -16,9 +16,14 @@ use libp2p::{
     core,
     core::muxing::StreamMuxerBox,
     core::transport::boxed::Boxed,
-    gossipsub::TopicHash,
+    // gossipsub::TopicHash,
     identity::{ed25519, Keypair},
-    mplex, noise, yamux, PeerId, Swarm, Transport,
+    mplex,
+    noise,
+    yamux,
+    PeerId,
+    Swarm,
+    Transport,
 };
 use libp2p_request_response::{RequestId, ResponseChannel};
 use log::{debug, error, info, trace, warn};
@@ -40,8 +45,7 @@ const PUBSUB_TOPICS: [&str; 2] = [PUBSUB_BLOCK_STR, PUBSUB_MSG_STR];
 pub enum NetworkEvent {
     PubsubMessage {
         source: Option<PeerId>,
-        topics: Vec<TopicHash>,
-        message: Vec<u8>,
+        message: PubsubMessage,
     },
     HelloRequest {
         request: HelloRequest,
@@ -65,6 +69,13 @@ pub enum NetworkEvent {
     BitswapBlock {
         cid: Cid,
     },
+}
+
+#[derive(Debug, Clone)]
+pub enum PubsubMessage {
+    // TODO include types for these
+    Block(()),
+    Message(()),
 }
 
 /// Events into this Service
@@ -167,11 +178,13 @@ where
                             message,
                         } => {
                             trace!("Got a Gossip Message from {:?}", source);
-                            emit_event(&self.network_sender_out, NetworkEvent::PubsubMessage {
-                                source,
-                                topics,
-                                message
-                            }).await;
+                            // TODO ! here what you need to do is deserialize the message based on
+                            // ! the topic into the new PubsubMessage type.
+                            // emit_event(&self.network_sender_out, NetworkEvent::PubsubMessage {
+                            //     source,
+                            //     topics,
+                            //     message
+                            // }).await;
                         }
                         ForestBehaviourEvent::HelloRequest { request, channel, .. } => {
                             debug!("Received hello request: {:?}", request);
