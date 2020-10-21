@@ -315,11 +315,9 @@ where
                     self.validate_tipset(fts).await?;
                     self.state.write().await.set_epoch(curr_epoch);
                     i -= 1;
-                    continue;
                 }
                 Err(_) => {
                     // no full tipset in storage; request messages via blocksync
-
                     let mut batch_size = REQUEST_WINDOW;
                     if i < batch_size {
                         batch_size = i;
@@ -368,7 +366,6 @@ where
                     }
 
                     i -= REQUEST_WINDOW;
-                    continue;
                 }
             }
         }
