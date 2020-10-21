@@ -308,8 +308,15 @@ where
 
         while i >= 0 {
             // check storage first to see if we have full tipset
-            let fts = match self.chain_store.fill_tipsets(ts[i as usize].clone()) {
-                Ok(fts) => fts,
+            match self.chain_store.fill_tipsets(ts[i as usize].clone()) {
+                Ok(fts) => {
+                    // full tipset found in storage; validate and continue
+                    let curr_epoch = fts.epoch();
+                    self.validate_tipset(fts).await?;
+                    self.state.write().await.set_epoch(curr_epoch);
+                    i -= 1;
+                    continue;
+                }
                 Err(_) => {
                     // no full tipset in storage; request messages via blocksync
 
@@ -363,13 +370,7 @@ where
                     i -= REQUEST_WINDOW;
                     continue;
                 }
-            };
-            // full tipset found in storage; validate and continue
-            let curr_epoch = fts.epoch();
-            self.validate_tipset(fts).await?;
-            self.state.write().await.set_epoch(curr_epoch);
-            i -= 1;
-            continue;
+            }
         }
 
         Ok(())
