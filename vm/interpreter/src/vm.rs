@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0, MIT
 
 use super::{
+    circ_supply::*,
     gas_tracker::{price_list_by_epoch, GasCharge},
     vm_send, DefaultRuntime, Rand,
 };
@@ -12,70 +13,81 @@ use actor::{
 use address::Address;
 use cid::Cid;
 use clock::ChainEpoch;
-use fil_types::{DevnetParams, NetworkParams};
+use fil_types::{
+    verifier::{FullVerifier, ProofVerifier},
+    DevnetParams, NetworkParams, NetworkVersion,
+};
 use forest_encoding::Cbor;
 use ipld_blockstore::BlockStore;
 use log::warn;
-use message::{Message, MessageReceipt, SignedMessage, UnsignedMessage};
+use message::{ChainMessage, Message, MessageReceipt, UnsignedMessage};
 use num_bigint::{BigInt, Sign};
 use num_traits::Zero;
-use runtime::Syscalls;
 use state_tree::StateTree;
 use std::collections::HashSet;
 use std::convert::TryFrom;
 use std::error::Error as StdError;
 use std::marker::PhantomData;
 use vm::{actor_error, ActorError, ExitCode, Serialized, TokenAmount};
-
 const GAS_OVERUSE_NUM: i64 = 11;
 const GAS_OVERUSE_DENOM: i64 = 10;
 
 #[derive(Debug)]
 pub struct BlockMessages {
     pub miner: Address,
-    pub bls_messages: Vec<UnsignedMessage>,
-    pub secpk_messages: Vec<SignedMessage>,
+    pub messages: Vec<ChainMessage>,
     pub win_count: i64,
 }
 
+// TODO replace with some trait or some generic solution (needs to use context)
+pub type CircSupplyCalc<BS> =
+    Box<dyn Fn(ChainEpoch, &StateTree<BS>) -> Result<TokenAmount, String>>;
+
 /// Interpreter which handles execution of state transitioning messages and returns receipts
 /// from the vm execution.
-pub struct VM<'db, 'r, DB, SYS, R, P = DevnetParams> {
+pub struct VM<'db, 'r, DB, R, N, V = FullVerifier, P = DevnetParams> {
     state: StateTree<'db, DB>,
     store: &'db DB,
     epoch: ChainEpoch,
-    syscalls: SYS,
     rand: &'r R,
     base_fee: BigInt,
     registered_actors: HashSet<Cid>,
+    network_version_getter: N,
+    circ_supply_calc: Option<CircSupplyCalc<DB>>,
+    verifier: PhantomData<V>,
     params: PhantomData<P>,
 }
 
-impl<'db, 'r, DB, SYS, R, P> VM<'db, 'r, DB, SYS, R, P>
+impl<'db, 'r, DB, R, N, V, P> VM<'db, 'r, DB, R, N, V, P>
 where
     DB: BlockStore,
-    SYS: Syscalls,
+    V: ProofVerifier,
     P: NetworkParams,
     R: Rand,
+    N: Fn(ChainEpoch) -> NetworkVersion,
 {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         root: &Cid,
         store: &'db DB,
         epoch: ChainEpoch,
-        syscalls: SYS,
         rand: &'r R,
         base_fee: BigInt,
+        network_version_getter: N,
+        circ_supply_calc: Option<CircSupplyCalc<DB>>,
     ) -> Result<Self, String> {
         let state = StateTree::new_from_root(store, root).map_err(|e| e.to_string())?;
         let registered_actors = HashSet::new();
         Ok(VM {
+            network_version_getter,
             state,
             store,
             epoch,
-            syscalls,
             rand,
             base_fee,
             registered_actors,
+            circ_supply_calc,
+            verifier: PhantomData,
             params: PhantomData,
         })
     }
@@ -106,17 +118,14 @@ where
 
     fn run_cron(
         &mut self,
-        callback: Option<&mut impl FnMut(Cid, UnsignedMessage, ApplyRet) -> Result<(), String>>,
+        epoch: ChainEpoch,
+        callback: Option<&mut impl FnMut(Cid, &ChainMessage, ApplyRet) -> Result<(), String>>,
     ) -> Result<(), Box<dyn StdError>> {
-        let sys_act = self
-            .state()
-            .get_actor(&*SYSTEM_ACTOR_ADDR)?
-            .ok_or_else(|| "Failed to query system actor".to_string())?;
-
         let cron_msg = UnsignedMessage {
             from: *SYSTEM_ACTOR_ADDR,
             to: *CRON_ACTOR_ADDR,
-            sequence: sys_act.sequence,
+            // Epoch as sequence is intentional
+            sequence: epoch as u64,
             gas_limit: 1 << 30,
             method_num: cron::Method::EpochTick as u64,
             params: Default::default(),
@@ -132,7 +141,7 @@ where
         }
 
         if let Some(callback) = callback {
-            callback(cron_msg.cid()?, cron_msg, ret)?;
+            callback(cron_msg.cid()?, &ChainMessage::Unsigned(cron_msg), ret)?;
         }
         Ok(())
     }
@@ -144,14 +153,14 @@ where
         messages: &[BlockMessages],
         parent_epoch: ChainEpoch,
         epoch: ChainEpoch,
-        mut callback: Option<impl FnMut(Cid, UnsignedMessage, ApplyRet) -> Result<(), String>>,
+        mut callback: Option<impl FnMut(Cid, &ChainMessage, ApplyRet) -> Result<(), String>>,
     ) -> Result<Vec<MessageReceipt>, Box<dyn StdError>> {
         let mut receipts = Vec::new();
         let mut processed = HashSet::<Cid>::default();
 
         for i in parent_epoch..epoch {
             if i > parent_epoch {
-                self.run_cron(callback.as_mut())?;
+                self.run_cron(epoch, callback.as_mut())?;
             }
             self.epoch = i + 1;
         }
@@ -160,7 +169,7 @@ where
             let mut penalty = Default::default();
             let mut gas_reward = Default::default();
 
-            let mut process_msg = |msg: &UnsignedMessage| -> Result<(), Box<dyn StdError>> {
+            let mut process_msg = |msg: &ChainMessage| -> Result<(), Box<dyn StdError>> {
                 let cid = msg.cid()?;
                 // Ensure no duplicate processing of a message
                 if processed.contains(&cid) {
@@ -168,7 +177,7 @@ where
                 }
                 let ret = self.apply_message(msg)?;
                 if let Some(cb) = &mut callback {
-                    cb(msg.cid()?, msg.clone(), ret.clone())?;
+                    cb(msg.cid()?, msg, ret.clone())?;
                 }
 
                 // Update totals
@@ -181,11 +190,8 @@ where
                 Ok(())
             };
 
-            for msg in &block.bls_messages {
+            for msg in block.messages.iter() {
                 process_msg(msg)?;
-            }
-            for msg in &block.secpk_messages {
-                process_msg(msg.message())?;
             }
 
             // Generate reward transaction for the miner of the block
@@ -196,17 +202,13 @@ where
                 win_count: block.win_count,
             })?;
 
-            let sys_act = self
-                .state()
-                .get_actor(&*SYSTEM_ACTOR_ADDR)?
-                .ok_or_else(|| "Failed to query system actor".to_string())?;
-
             let rew_msg = UnsignedMessage {
                 from: *SYSTEM_ACTOR_ADDR,
                 to: *REWARD_ACTOR_ADDR,
                 method_num: reward::Method::AwardBlockReward as u64,
                 params,
-                sequence: sys_act.sequence,
+                // Epoch as sequence is intentional
+                sequence: epoch as u64,
                 gas_limit: 1 << 30,
                 value: Default::default(),
                 version: Default::default(),
@@ -233,11 +235,11 @@ where
             }
 
             if let Some(callback) = &mut callback {
-                callback(rew_msg.cid()?, rew_msg, ret)?;
+                callback(rew_msg.cid()?, &ChainMessage::Unsigned(rew_msg), ret)?;
             }
         }
 
-        self.run_cron(callback.as_mut())?;
+        self.run_cron(epoch, callback.as_mut())?;
         Ok(receipts)
     }
 
@@ -262,11 +264,11 @@ where
 
     /// Applies the state transition for a single message
     /// Returns ApplyRet structure which contains the message receipt and some meta data.
-    pub fn apply_message(&mut self, msg: &UnsignedMessage) -> Result<ApplyRet, String> {
-        check_message(msg)?;
+    pub fn apply_message(&mut self, msg: &ChainMessage) -> Result<ApplyRet, String> {
+        check_message(msg.message())?;
 
         let pl = price_list_by_epoch(self.epoch());
-        let ser_msg = &msg.marshal_cbor().map_err(|e| e.to_string())?;
+        let ser_msg = msg.marshal_cbor().map_err(|e| e.to_string())?;
         let msg_gas_cost = pl.on_chain_message(ser_msg.len());
         let cost_total = msg_gas_cost.total();
 
@@ -351,9 +353,9 @@ where
             })
             .map_err(|e| e.to_string())?;
 
-        self.state.snapshot().map_err(|e| e.to_string())?;
+        self.state.snapshot()?;
 
-        let (mut ret_data, rt, mut act_err) = self.send(msg, Some(msg_gas_cost));
+        let (mut ret_data, rt, mut act_err) = self.send(msg.message(), Some(msg_gas_cost));
         if let Some(err) = &act_err {
             if err.is_fatal() {
                 return Err(format!(
@@ -403,7 +405,7 @@ where
         let err_code = if let Some(err) = &act_err {
             if !err.is_ok() {
                 // Revert all state changes on error.
-                self.state.revert_to_snapshot().map_err(|e| e.to_string())?;
+                self.state.revert_to_snapshot()?;
             }
             err.exit_code()
         } else {
@@ -429,6 +431,10 @@ where
             if amt.sign() == Sign::Minus {
                 return Err("attempted to transfer negative value into actor".into());
             }
+            if amt.is_zero() {
+                return Ok(());
+            }
+
             self.state
                 .mutate_actor(addr, |act| {
                     act.deposit_funds(&amt);
@@ -450,7 +456,7 @@ where
         if &base_fee_burn + over_estimation_burn + &refund + &miner_tip != gas_cost {
             return Err("Gas handling math is wrong".to_owned());
         }
-        self.state.clear_snapshot().map_err(|e| e.to_string())?;
+        self.state.clear_snapshot()?;
 
         Ok(ApplyRet {
             msg_receipt: MessageReceipt {
@@ -472,21 +478,29 @@ where
         gas_cost: Option<GasCharge>,
     ) -> (
         Serialized,
-        Option<DefaultRuntime<'db, '_, '_, '_, '_, DB, SYS, R, P>>,
+        Option<DefaultRuntime<'db, '_, DB, R, V, P>>,
         Option<ActorError>,
     ) {
+        let default_preignition =
+            setup_preignition_genesis_actors_testnet(self.store).unwrap_or_default();
+        let default_postignition =
+            setup_postignition_genesis_actors_testnet(self.store).unwrap_or_default();
+
         let res = DefaultRuntime::new(
+            (self.network_version_getter)(self.epoch),
             &mut self.state,
             self.store,
-            &self.syscalls,
             0,
             &msg,
             self.epoch,
             *msg.from(),
             msg.sequence(),
             0,
+            default_preignition,
+            default_postignition,
             self.rand,
             &self.registered_actors,
+            &self.circ_supply_calc,
         );
 
         match res {

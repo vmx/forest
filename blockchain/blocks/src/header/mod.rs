@@ -1,13 +1,14 @@
 // Copyright 2020 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
-use super::{Error, Ticket, Tipset, TipsetKeys};
+use super::{ElectionProof, Error, Ticket, TipsetKeys};
 use address::Address;
 use beacon::{self, Beacon, BeaconEntry};
 use cid::{multihash::Blake2b256, Cid};
 use clock::ChainEpoch;
-use crypto::{election_proof::ElectionProof, Signature};
+use crypto::Signature;
 use derive_builder::Builder;
+use encoding::blake2b_256;
 use encoding::{Cbor, Error as EncodingError};
 use fil_types::PoStProof;
 use num_bigint::{
@@ -16,9 +17,7 @@ use num_bigint::{
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::Digest;
-use std::cmp::Ordering;
 use std::fmt;
-use std::time::{SystemTime, UNIX_EPOCH};
 use vm::TokenAmount;
 
 #[cfg(feature = "json")]
@@ -52,7 +51,7 @@ const BLOCKS_PER_EPOCH: u64 = 5;
 ///     .weight(BigInt::from(0u8)) // optional
 ///     .epoch(0) // optional
 ///     .timestamp(0) // optional
-///     .ticket(Ticket::default()) // optional
+///     .ticket(Some(Ticket::default())) // optional
 ///     .fork_signal(0) // optional
 ///     .build_and_validate()
 ///     .unwrap();
@@ -117,7 +116,7 @@ pub struct BlockHeader {
     timestamp: u64,
     /// the ticket submitted with this block
     #[builder(default)]
-    ticket: Ticket,
+    ticket: Option<Ticket>,
     // SIGNATURES
     /// aggregate signature of miner in block
     #[builder(default)]
@@ -216,21 +215,6 @@ impl<'de> Deserialize<'de> for BlockHeader {
     }
 }
 
-impl Ord for BlockHeader {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.ticket()
-            .cmp(other.ticket())
-            // Only compare cid bytes when tickets are equal
-            .then_with(|| self.cid().to_bytes().cmp(&other.cid().to_bytes()))
-    }
-}
-
-impl PartialOrd for BlockHeader {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
 impl BlockHeader {
     /// Generates a BlockHeader builder as a constructor
     pub fn builder() -> BlockHeaderBuilder {
@@ -277,7 +261,7 @@ impl BlockHeader {
         self.timestamp
     }
     /// Getter for BlockHeader ticket
-    pub fn ticket(&self) -> &Ticket {
+    pub fn ticket(&self) -> &Option<Ticket> {
         &self.ticket
     }
     /// Getter for BlockHeader bls_aggregate
@@ -305,6 +289,11 @@ impl BlockHeader {
     pub fn signature(&self) -> &Option<Signature> {
         &self.signature
     }
+    /// Key used for sorting headers and blocks.
+    pub fn to_sort_key(&self) -> Option<([u8; 32], Vec<u8>)> {
+        let ticket_hash = blake2b_256(self.ticket().as_ref()?.vrfproof.as_bytes());
+        Some((ticket_hash, self.cid().to_bytes()))
+    }
     /// Updates cache and returns mutable reference of header back
     fn update_cache(&mut self) -> Result<(), String> {
         self.cached_bytes = self.marshal_cbor().map_err(|e| e.to_string())?;
@@ -324,37 +313,8 @@ impl BlockHeader {
 
         Ok(())
     }
-    /// Validates timestamps to ensure BlockHeader was generated at the correct time
-    pub fn validate_timestamps(&self, base_tipset: &Tipset) -> Result<(), Error> {
-        // first check that it is not in the future; see https://github.com/filecoin-project/specs/blob/6ab401c0b92efb6420c6e198ec387cf56dc86057/validation.md
-        // allowing for some small grace period to deal with small asynchrony
-        // using ALLOWABLE_CLOCK_DRIFT from Lotus; see https://github.com/filecoin-project/lotus/blob/master/build/params_shared.go#L34:7
-        const ALLOWABLE_CLOCK_DRIFT: u64 = 1;
-        let time_now = SystemTime::now().duration_since(UNIX_EPOCH)?;
-        if self.timestamp() > time_now.as_secs() + ALLOWABLE_CLOCK_DRIFT
-            || self.timestamp() > time_now.as_secs()
-        {
-            return Err(Error::Validation("Header was from the future".to_string()));
-        }
-        // TODO: This is a devnet param. When we start testing on other networks, we'll change it.
-        const FIXED_BLOCK_DELAY: u64 = 2;
-        // check that it is appropriately delayed from its parents including null blocks
-        if self.timestamp()
-            < base_tipset.min_timestamp()
-                + FIXED_BLOCK_DELAY * (self.epoch() - base_tipset.epoch()) as u64
-        {
-            return Err(Error::Validation(format!(
-                "Header was generated too soon: timestamp: {}, max time: {}",
-                self.timestamp(),
-                base_tipset.min_timestamp()
-                    + FIXED_BLOCK_DELAY * (self.epoch() - base_tipset.epoch()) as u64
-            )));
-        }
-
-        Ok(())
-    }
     /// Returns true if (h(vrfout) * totalPower) < (e * sectorSize * 2^256)
-    pub fn is_ticket_winner(&self, mpow: BigInt, net_pow: BigInt) -> bool {
+    pub fn is_ticket_winner(ticket: &Ticket, mpow: BigInt, net_pow: BigInt) -> bool {
         /*
         Need to check that
         (h(vrfout) + 1) / (max(h) + 1) <= e * myPower / totalPower
@@ -365,9 +325,8 @@ impl BlockHeader {
         h(vrfout) * totalPower < e * myPower * 2^256
         */
 
-        // TODO switch ticket for election_proof
-        let h = sha2::Sha256::digest(self.ticket.vrfproof.as_bytes());
-        let mut lhs = BigInt::from_signed_bytes_le(&h);
+        let h = sha2::Sha256::digest(ticket.vrfproof.as_bytes());
+        let mut lhs = BigInt::from_signed_bytes_be(&h);
         lhs *= net_pow;
 
         // rhs = sectorSize * 2^256
@@ -383,8 +342,9 @@ impl BlockHeader {
     pub async fn validate_block_drand<B: Beacon>(
         &self,
         beacon: &B,
-        prev_entry: BeaconEntry,
+        prev_entry: &BeaconEntry,
     ) -> Result<(), Error> {
+        // TODO validation may need to use the beacon schedule from `ChainSyncer`. Seems outdated
         let max_round = beacon.max_beacon_round_for_epoch(self.epoch);
         if max_round == prev_entry.round() {
             if !self.beacon_entries.is_empty() {
@@ -405,7 +365,7 @@ impl BlockHeader {
             )));
         }
 
-        let mut prev = &prev_entry;
+        let mut prev = prev_entry;
         for curr in &self.beacon_entries {
             if !beacon
                 .verify_entry(&curr, &prev)

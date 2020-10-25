@@ -1,27 +1,32 @@
 // Copyright 2020 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
-use super::cli::{block_until_sigint, initialize_genesis, Config};
+use super::cli::{block_until_sigint, Config};
 use actor::EPOCH_DURATION_SECONDS;
 use async_std::sync::RwLock;
 use async_std::task;
+use auth::{generate_priv_key, JWT_IDENTIFIER};
 use beacon::{DrandBeacon, DEFAULT_DRAND_URL};
 use chain::ChainStore;
 use chain_sync::ChainSyncer;
 use db::RocksDb;
+use fil_types::verifier::FullVerifier;
+use flo_stream::{MessagePublisher, Publisher};
 use forest_libp2p::{get_keypair, Libp2pService};
+use genesis::initialize_genesis;
 use libp2p::identity::{ed25519, Keypair};
 use log::{debug, info, trace};
-use message_pool::{MessagePool, MpoolRpcProvider};
+use message_pool::{MessagePool, MpoolConfig, MpoolRpcProvider};
+use paramfetch::{get_params_default, SectorSizeOpt};
 use rpc::{start_rpc, RpcState};
 use state_manager::StateManager;
 use std::sync::Arc;
 use utils::write_to_file;
-use wallet::PersistentKeyStore;
+use wallet::{KeyStore, PersistentKeyStore};
 
 /// Number of tasks spawned for sync workers.
-// TODO benchmark and/or add this as a config option.
-const WORKER_TASKS: usize = 3;
+// TODO benchmark and/or add this as a config option. (1 is temporary value to avoid overlap)
+const WORKER_TASKS: usize = 1;
 
 /// Starts daemon process
 pub(super) async fn start(config: Config) {
@@ -44,9 +49,12 @@ pub(super) async fn start(config: Config) {
         });
 
     // Initialize keystore
-    let keystore = Arc::new(RwLock::new(
-        PersistentKeyStore::new(config.data_dir.to_string()).unwrap(),
-    ));
+    let mut ks = PersistentKeyStore::new(config.data_dir.to_string()).unwrap();
+    if ks.get(JWT_IDENTIFIER).is_err() {
+        ks.put(JWT_IDENTIFIER.to_owned(), generate_priv_key())
+            .unwrap();
+    }
+    let keystore = Arc::new(RwLock::new(ks));
 
     // Initialize database
     let mut db = RocksDb::new(config.data_dir + "/db");
@@ -54,9 +62,21 @@ pub(super) async fn start(config: Config) {
     let db = Arc::new(db);
     let mut chain_store = ChainStore::new(Arc::clone(&db));
 
+    // Initialize StateManager
+    let state_manager = Arc::new(StateManager::new(Arc::clone(&db)));
+
     // Read Genesis file
-    let (genesis, network_name) =
-        initialize_genesis(&config.genesis_file, &mut chain_store).unwrap();
+    let (genesis, network_name) = initialize_genesis(
+        config.genesis_file.as_ref(),
+        &mut chain_store,
+        &state_manager,
+    )
+    .unwrap();
+
+    // Fetch and ensure verification keys are downloaded
+    get_params_default(SectorSizeOpt::Keys, false)
+        .await
+        .unwrap();
 
     // Libp2p service setup
     let p2p_service =
@@ -64,16 +84,18 @@ pub(super) async fn start(config: Config) {
     let network_rx = p2p_service.network_receiver();
     let network_send = p2p_service.network_sender();
 
-    // Initialize StateManager
-    let state_manager = Arc::new(StateManager::new(Arc::clone(&db)));
-
     // Initialize mpool
-    let subscriber = chain_store.subscribe().await;
+    let publisher = chain_store.publisher();
+    let subscriber = publisher.write().await.subscribe();
     let provider = MpoolRpcProvider::new(subscriber, Arc::clone(&state_manager));
     let mpool = Arc::new(
-        MessagePool::new(provider, network_name.clone())
-            .await
-            .unwrap(),
+        MessagePool::new(
+            provider,
+            network_name.clone(),
+            MpoolConfig::load_config(db.as_ref()).unwrap(),
+        )
+        .await
+        .unwrap(),
     );
 
     // Get Drand Coefficients
@@ -89,8 +111,10 @@ pub(super) async fn start(config: Config) {
     .unwrap();
 
     // Initialize ChainSyncer
-    let chain_syncer = ChainSyncer::new(
-        Arc::new(chain_store),
+    let chain_store_arc = Arc::new(chain_store);
+    // TODO allow for configuring validation strategy (defaulting to full validation)
+    let chain_syncer = ChainSyncer::<_, _, FullVerifier>::new(
+        chain_store_arc.clone(),
         Arc::clone(&state_manager),
         Arc::new(beacon),
         network_send.clone(),
@@ -108,7 +132,6 @@ pub(super) async fn start(config: Config) {
     let p2p_task = task::spawn(async {
         p2p_service.run().await;
     });
-
     let rpc_task = if config.enable_rpc {
         let keystore_rpc = Arc::clone(&keystore);
         let rpc_listen = format!("127.0.0.1:{}", &config.rpc_port);
@@ -123,6 +146,8 @@ pub(super) async fn start(config: Config) {
                     sync_state,
                     network_send,
                     network_name,
+                    chain_store: chain_store_arc,
+                    events_pubsub: Arc::new(RwLock::new(Publisher::new(1000))),
                 },
                 &rpc_listen,
             )

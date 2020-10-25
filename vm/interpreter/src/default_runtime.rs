@@ -1,32 +1,38 @@
 // Copyright 2020 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
+use super::circ_supply::*;
 use super::gas_block_store::GasBlockStore;
-use super::gas_syscalls::GasSyscalls;
 use super::gas_tracker::{price_list_by_epoch, GasCharge, GasTracker, PriceList};
-use super::Rand;
+use super::{CircSupplyCalc, Rand};
 use actor::*;
 use address::{Address, Protocol};
+use blocks::BlockHeader;
 use byteorder::{BigEndian, WriteBytesExt};
 use cid::{multihash::Blake2b256, Cid};
 use clock::ChainEpoch;
-use crypto::DomainSeparationTag;
-use fil_types::{DevnetParams, NetworkParams};
-use forest_encoding::to_vec;
-use forest_encoding::Cbor;
+use crypto::{DomainSeparationTag, Signature};
+use fil_types::{verifier::ProofVerifier, DevnetParams, NetworkParams, NetworkVersion, Randomness};
+use fil_types::{PieceInfo, RegisteredSealProof, SealVerifyInfo, WindowPoStVerifyInfo};
+use forest_encoding::{blake2b_256, to_vec, Cbor};
 use ipld_blockstore::BlockStore;
 use log::warn;
 use message::{Message, UnsignedMessage};
 use num_bigint::BigInt;
 use num_traits::Zero;
-use runtime::{ActorCode, MessageInfo, Runtime, Syscalls};
+use rayon::prelude::*;
+use runtime::{
+    compute_unsealed_sector_cid, ActorCode, ConsensusFault, ConsensusFaultType, MessageInfo,
+    Runtime, Syscalls,
+};
 use state_tree::StateTree;
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::error::Error as StdError;
 use std::marker::PhantomData;
 use std::rc::Rc;
 use vm::{
-    actor_error, ActorError, ActorState, ExitCode, MethodNum, Randomness, Serialized, TokenAmount,
+    actor_error, ActorError, ActorState, ExitCode, MethodNum, Serialized, TokenAmount,
     EMPTY_ARR_CID, METHOD_SEND,
 };
 
@@ -57,10 +63,10 @@ impl MessageInfo for VMMsg {
 }
 
 /// Implementation of the Runtime trait.
-pub struct DefaultRuntime<'db, 'st, 'sys, 'r, 'act, BS, SYS, R, P = DevnetParams> {
-    state: &'st mut StateTree<'db, BS>,
+pub struct DefaultRuntime<'db, 'vm, BS, R, V, P = DevnetParams> {
+    version: NetworkVersion,
+    state: &'vm mut StateTree<'db, BS>,
     store: GasBlockStore<'db, BS>,
-    syscalls: GasSyscalls<'sys, SYS>,
     gas_tracker: Rc<RefCell<GasTracker>>,
     vm_msg: VMMsg,
     epoch: ChainEpoch,
@@ -68,35 +74,41 @@ pub struct DefaultRuntime<'db, 'st, 'sys, 'r, 'act, BS, SYS, R, P = DevnetParams
     origin_nonce: u64,
     num_actors_created: u64,
     price_list: PriceList,
-    rand: &'r R,
+    rand: &'vm R,
     caller_validated: bool,
     allow_internal: bool,
-    registered_actors: &'act HashSet<Cid>,
+    registered_actors: &'vm HashSet<Cid>,
+    circ_supply_calc: &'vm Option<CircSupplyCalc<BS>>,
+    verifier: PhantomData<V>,
     params: PhantomData<P>,
+    pre_ignition: GenesisInfo,
+    post_ignition: GenesisInfo,
 }
 
-impl<'db, 'st, 'sys, 'r, 'act, BS, SYS, R, P>
-    DefaultRuntime<'db, 'st, 'sys, 'r, 'act, BS, SYS, R, P>
+impl<'db, 'vm, BS, R, V, P> DefaultRuntime<'db, 'vm, BS, R, V, P>
 where
     BS: BlockStore,
-    SYS: Syscalls,
+    V: ProofVerifier,
     P: NetworkParams,
     R: Rand,
 {
     /// Constructs a new Runtime
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        state: &'st mut StateTree<'db, BS>,
+        version: NetworkVersion,
+        state: &'vm mut StateTree<'db, BS>,
         store: &'db BS,
-        syscalls: &'sys SYS,
         gas_used: i64,
         message: &UnsignedMessage,
         epoch: ChainEpoch,
         origin: Address,
         origin_nonce: u64,
         num_actors_created: u64,
-        rand: &'r R,
-        registered_actors: &'act HashSet<Cid>,
+        pre_ignition: GenesisInfo,
+        post_ignition: GenesisInfo,
+        rand: &'vm R,
+        registered_actors: &'vm HashSet<Cid>,
+        circ_supply_calc: &'vm Option<CircSupplyCalc<BS>>,
     ) -> Result<Self, ActorError> {
         let price_list = price_list_by_epoch(epoch);
         let gas_tracker = Rc::new(RefCell::new(GasTracker::new(message.gas_limit(), gas_used)));
@@ -105,15 +117,10 @@ where
             gas: Rc::clone(&gas_tracker),
             store,
         };
-        let gas_syscalls = GasSyscalls {
-            price_list: price_list.clone(),
-            gas: Rc::clone(&gas_tracker),
-            syscalls,
-        };
 
         let caller_id = state
             .lookup_id(&message.from())
-            .map_err(|e| actor_error!(fatal("failed to lookup id: {}", e)))?
+            .map_err(|e| e.downcast_fatal("failed to lookup id"))?
             .ok_or_else(
                 || actor_error!(SysErrInvalidReceiver; "resolve msg from address failed"),
             )?;
@@ -125,9 +132,9 @@ where
         };
 
         Ok(DefaultRuntime {
+            version,
             state,
             store: gas_block_store,
-            syscalls: gas_syscalls,
             gas_tracker,
             vm_msg,
             epoch,
@@ -137,9 +144,13 @@ where
             price_list,
             rand,
             registered_actors,
+            circ_supply_calc,
             allow_internal: true,
             caller_validated: false,
             params: PhantomData,
+            pre_ignition,
+            post_ignition,
+            verifier: PhantomData,
         })
     }
 
@@ -169,7 +180,7 @@ where
         Ok(self
             .state
             .get_actor(&addr)
-            .map_err(|e| actor_error!(fatal("failed to get actor in get balance: {}", e)))?
+            .map_err(|e| e.downcast_fatal("failed to get actor in get balance"))?
             .map(|act| act.balance)
             .unwrap_or_default())
     }
@@ -180,7 +191,7 @@ where
         let mut actor = self
             .state
             .get_actor(&to_addr)
-            .map_err(|e| actor_error!(fatal("failed to get actor to commit state: {}", e)))?
+            .map_err(|e| e.downcast_fatal("failed to get actor to commit state"))?
             .ok_or_else(|| actor_error!(fatal("failed to get actor to commit state")))?;
 
         if &actor.state != old_h {
@@ -191,7 +202,7 @@ where
         actor.state = new_h;
         self.state
             .set_actor(&to_addr, actor)
-            .map_err(|e| actor_error!(fatal("failed to set actor in state_commit: {}", e)))?;
+            .map_err(|e| e.downcast_fatal("failed to set actor in state_commit"))?;
 
         Ok(())
     }
@@ -213,7 +224,7 @@ where
     {
         self.store
             .put(obj, Blake2b256)
-            .map_err(|e| ActorError::downcast_fatal(e, "failed to put cbor object"))
+            .map_err(|e| e.downcast_fatal("failed to put cbor object"))
     }
 
     /// Helper function for getting deserializable objects from blockstore.
@@ -223,7 +234,7 @@ where
     {
         self.store
             .get(cid)
-            .map_err(|e| ActorError::downcast_fatal(e, "failed to get cbor object"))
+            .map_err(|e| e.downcast_fatal("failed to get cbor object"))
     }
 
     fn internal_send(
@@ -257,7 +268,7 @@ where
         // snapshot state tree
         self.state
             .snapshot()
-            .map_err(|e| actor_error!(fatal("failed to create snapshot {}", e)))?;
+            .map_err(|e| actor_error!(fatal("failed to create snapshot: {}", e)))?;
 
         // Since it is unsafe to share a mutable reference to the state tree by copying
         // the runtime, all variables must be copied and reset at the end of the transition.
@@ -270,7 +281,7 @@ where
         };
         self.caller_validated = false;
 
-        let send_res = vm_send::<BS, SYS, R, P>(self, &msg, None);
+        let send_res = vm_send::<BS, R, V, P>(self, &msg, None);
 
         // Reset values back to their values before the call
         self.vm_msg = prev_msg;
@@ -297,13 +308,13 @@ where
         let addr_id = self
             .state
             .register_new_address(addr)
-            .map_err(|e| actor_error!(fatal("failed to register new address: {}", e)))?;
+            .map_err(|e| e.downcast_fatal("failed to register new address"))?;
 
         let act = make_actor(addr)?;
 
         self.state
             .set_actor(&addr_id, act)
-            .map_err(|e| actor_error!(fatal("failed to set actor: {}", e)))?;
+            .map_err(|e| e.downcast_fatal("failed to set actor"))?;
 
         let p = Serialized::serialize(&addr).map_err(|e| {
             actor_error!(fatal(
@@ -318,26 +329,46 @@ where
             account::Method::Constructor as u64,
             TokenAmount::from(0),
             p,
-        )?;
+        )
+        .map_err(|e| e.wrap("failed to invoke account constructor"))?;
 
         let act = self
             .state
             .get_actor(&addr_id)
-            .map_err(|e| actor_error!(fatal("failed to get actor: {}", e)))?
+            .map_err(|e| e.downcast_fatal("failed to get actor"))?
             .ok_or_else(|| actor_error!(fatal("failed to retrieve created actor state")))?;
 
         Ok(act)
     }
+
+    fn verify_block_signature(&self, bh: &BlockHeader) -> Result<(), Box<dyn StdError>> {
+        let actor = self
+            .state
+            .get_actor(bh.miner_address())?
+            .ok_or_else(|| format!("actor not found {:?}", bh.miner_address()))?;
+
+        let ms: miner::State = self
+            .store
+            .get(&actor.state)?
+            .ok_or_else(|| format!("actor state not found {:?}", actor.state.to_string()))?;
+
+        let info = ms.get_info(&self.store)?;
+        let work_address = resolve_to_key_addr(&self.state, &self.store, &info.worker)?;
+        bh.check_block_signature(&work_address)?;
+        Ok(())
+    }
 }
 
-impl<'bs, BS, SYS, R, P> Runtime<GasBlockStore<'bs, BS>>
-    for DefaultRuntime<'bs, '_, '_, '_, '_, BS, SYS, R, P>
+impl<'bs, BS, R, V, P> Runtime<GasBlockStore<'bs, BS>> for DefaultRuntime<'bs, '_, BS, R, V, P>
 where
     BS: BlockStore,
-    SYS: Syscalls,
+    V: ProofVerifier,
     P: NetworkParams,
     R: Rand,
 {
+    fn network_version(&self) -> NetworkVersion {
+        self.version
+    }
     fn message(&self) -> &dyn MessageInfo {
         &self.vm_msg
     }
@@ -387,14 +418,14 @@ where
     fn resolve_address(&self, address: &Address) -> Result<Option<Address>, ActorError> {
         self.state
             .lookup_id(&address)
-            .map_err(|e| actor_error!(fatal("failed to look up id: {}", e)))
+            .map_err(|e| e.downcast_fatal("failed to look up id"))
     }
 
     fn get_actor_code_cid(&self, addr: &Address) -> Result<Option<Cid>, ActorError> {
         Ok(self
             .state
             .get_actor(&addr)
-            .map_err(|e| actor_error!(fatal("failed to get actor: {}", e)))?
+            .map_err(|e| e.downcast_fatal("failed to get actor"))?
             .map(|act| act.code))
     }
 
@@ -407,7 +438,7 @@ where
         let r = self
             .rand
             .get_chain_randomness(&self.store, personalization, rand_epoch, entropy)
-            .map_err(|e| actor_error!(fatal("could not get randomness: {}", e.to_string())))?;
+            .map_err(|e| e.downcast_fatal("could not get randomness"))?;
 
         Ok(Randomness(r))
     }
@@ -420,8 +451,8 @@ where
     ) -> Result<Randomness, ActorError> {
         let r = self
             .rand
-            .get_chain_randomness(&self.store, personalization, rand_epoch, entropy)
-            .map_err(|e| actor_error!(fatal("could not get randomness: {}", e.to_string())))?;
+            .get_beacon_randomness(&self.store, personalization, rand_epoch, entropy)
+            .map_err(|e| e.downcast_fatal("could not get randomness"))?;
 
         Ok(Randomness(r))
     }
@@ -437,8 +468,10 @@ where
             .state
             .get_actor(self.message().receiver())
             .map_err(|e| {
-                actor_error!(SysErrorIllegalArgument;
-                "failed to get actor for Readonly state: {}", e)
+                e.downcast_default(
+                    ExitCode::SysErrorIllegalArgument,
+                    "failed to get actor for Readonly state",
+                )
             })?
             .ok_or_else(
                 || actor_error!(SysErrorIllegalArgument; "Actor readonly state does not exist"),
@@ -459,10 +492,19 @@ where
         F: FnOnce(&mut C, &mut Self) -> Result<RT, ActorError>,
     {
         // get actor
-        let act = self.state.get_actor(self.message().receiver())
-            .map_err(|e| actor_error!(SysErrorIllegalActor; "failed to get actor for transaction: {}", e))?
-            .ok_or_else(|| actor_error!(SysErrorIllegalActor;
-                "actor state for transaction doesn't exist"))?;
+        let act = self
+            .state
+            .get_actor(self.message().receiver())
+            .map_err(|e| {
+                e.downcast_default(
+                    ExitCode::SysErrorIllegalActor,
+                    "failed to get actor for transaction",
+                )
+            })?
+            .ok_or_else(|| {
+                actor_error!(SysErrorIllegalActor;
+                "actor state for transaction doesn't exist")
+            })?;
 
         // get state for actor based on generic C
         let mut state: C = self
@@ -548,7 +590,7 @@ where
                 &address,
                 ActorState::new(code_id, EMPTY_ARR_CID.clone(), 0.into(), 0),
             )
-            .map_err(|e| actor_error!(fatal("creating actor entry: {}", e)))
+            .map_err(|e| e.downcast_fatal("creating actor entry"))
     }
 
     /// DeleteActor deletes the executing actor from the state tree, transferring
@@ -561,78 +603,242 @@ where
         let balance = self
             .state
             .get_actor(&receiver)
-            .map_err(|e| actor_error!(fatal("failed to get actor {}, {}", receiver, e)))?
+            .map_err(|e| e.downcast_fatal(format!("failed to get actor {}", receiver)))?
             .ok_or_else(
                 || actor_error!(SysErrorIllegalActor; "failed to load actor in delete actor"),
             )
             .map(|act| act.balance)?;
         if balance != 0.into() {
             // Transfer the executing actor's balance to the beneficiary
-            transfer(self.state, &receiver, beneficiary, &balance).map_err(|e| {
-                actor_error!(fatal(
-                    "failed to transfer balance to beneficiary actor: {}",
-                    e.msg()
-                ))
-            })?;
+            transfer(self.state, &receiver, beneficiary, &balance)
+                .map_err(|e| e.wrap("failed to transfer balance to beneficiary actor"))?;
         }
 
         // Delete the executing actor
         self.state
             .delete_actor(&receiver)
-            .map_err(|e| actor_error!(fatal("failed to delete actor: {}", e)))
+            .map_err(|e| e.downcast_fatal("failed to delete actor"))
     }
     fn syscalls(&self) -> &dyn Syscalls {
-        &self.syscalls
+        self
     }
     fn total_fil_circ_supply(&self) -> Result<TokenAmount, ActorError> {
-        let get_actor_state = |addr: &Address| -> Result<ActorState, ActorError> {
-            self.state
-                .get_actor(&addr)
-                .map_err(|e| {
-                    actor_error!(ErrIllegalState;
-                        "failed to get reward actor for cumputing total supply: {}", e)
-                })?
-                .ok_or_else(
-                    || actor_error!(ErrIllegalState; "Actor address ({}) does not exist", addr),
-                )
-        };
+        if let Some(circ_supply_calc) = self.circ_supply_calc.as_ref() {
+            // TODO all circ supply calculations should go through trait and not only override
+            return circ_supply_calc(self.epoch, &self.state).map_err(|e| {
+                actor_error!(ErrIllegalState, "failed to get total circ supply: {}", e)
+            });
+        }
 
-        let rew = get_actor_state(&REWARD_ACTOR_ADDR)?;
-        let burnt = get_actor_state(&BURNT_FUNDS_ACTOR_ADDR)?;
-        let market = get_actor_state(&STORAGE_MARKET_ACTOR_ADDR)?;
-        let power = get_actor_state(&STORAGE_POWER_ACTOR_ADDR)?;
-
-        let st: power::State = self
-            .store
-            .get(&power.state)
-            .map_err(|e| {
-                actor_error!(ErrIllegalState;
-                    "failed to get storage power state: {}", e.to_string())
-            })?
-            .ok_or_else(|| actor_error!(ErrIllegalState; "Failed to retrieve power state"))?;
-
-        let total = P::from_fil(P::TOTAL_FILECOIN)
-            - rew.balance
-            - market.balance
-            - burnt.balance
-            - st.total_pledge_collateral;
-        Ok(total)
+        // Use the normal method
+        get_circulating_supply(
+            &self.pre_ignition,
+            &self.post_ignition,
+            self.epoch,
+            self.state,
+        )
+        .map_err(|e| actor_error!(ErrIllegalState, "failed to get total circ supply: {}", e))
     }
     fn charge_gas(&mut self, name: &'static str, compute: i64) -> Result<(), ActorError> {
         self.charge_gas(GasCharge::new(name, compute, 0))
     }
 }
 
+impl<'bs, BS, R, V, P> Syscalls for DefaultRuntime<'bs, '_, BS, R, V, P>
+where
+    BS: BlockStore,
+    V: ProofVerifier,
+    P: NetworkParams,
+    R: Rand,
+{
+    fn verify_signature(
+        &self,
+        signature: &Signature,
+        signer: &Address,
+        plaintext: &[u8],
+    ) -> Result<(), Box<dyn StdError>> {
+        self.gas_tracker.borrow_mut().charge_gas(
+            self.price_list
+                .on_verify_signature(signature.signature_type()),
+        )?;
+
+        // Resolve to key address before verifying signature.
+        let signing_addr = resolve_to_key_addr(self.state, &self.store, signer)?;
+        Ok(signature.verify(plaintext, &signing_addr)?)
+    }
+    fn hash_blake2b(&self, data: &[u8]) -> Result<[u8; 32], Box<dyn StdError>> {
+        self.gas_tracker
+            .borrow_mut()
+            .charge_gas(self.price_list.on_hashing(data.len()))?;
+
+        Ok(blake2b_256(data))
+    }
+    fn compute_unsealed_sector_cid(
+        &self,
+        reg: RegisteredSealProof,
+        pieces: &[PieceInfo],
+    ) -> Result<Cid, Box<dyn StdError>> {
+        self.gas_tracker
+            .borrow_mut()
+            .charge_gas(self.price_list.on_compute_unsealed_sector_cid(reg, pieces))?;
+
+        compute_unsealed_sector_cid(reg, pieces)
+    }
+    fn verify_seal(&self, vi: &SealVerifyInfo) -> Result<(), Box<dyn StdError>> {
+        self.gas_tracker
+            .borrow_mut()
+            .charge_gas(self.price_list.on_verify_seal(vi))?;
+
+        V::verify_seal(vi)
+    }
+    fn verify_post(&self, vi: &WindowPoStVerifyInfo) -> Result<(), Box<dyn StdError>> {
+        self.gas_tracker
+            .borrow_mut()
+            .charge_gas(self.price_list.on_verify_post(vi))?;
+
+        V::verify_window_post(vi.randomness, &vi.proofs, &vi.challenged_sectors, vi.prover)
+    }
+    fn verify_consensus_fault(
+        &self,
+        h1: &[u8],
+        h2: &[u8],
+        extra: &[u8],
+    ) -> Result<Option<ConsensusFault>, Box<dyn StdError>> {
+        self.gas_tracker
+            .borrow_mut()
+            .charge_gas(self.price_list.on_verify_consensus_fault())?;
+
+        // Note that block syntax is not validated. Any validly signed block will be accepted pursuant to the below conditions.
+        // Whether or not it could ever have been accepted in a chain is not checked/does not matter here.
+        // for that reason when checking block parent relationships, rather than instantiating a Tipset to do so
+        // (which runs a syntactic check), we do it directly on the CIDs.
+
+        // (0) cheap preliminary checks
+
+        if h1 == h2 {
+            return Err(format!(
+                "no consensus fault: submitted blocks are the same: {:?}, {:?}",
+                h1, h2
+            )
+            .into());
+        };
+        let bh_1 = BlockHeader::unmarshal_cbor(h1)?;
+        let bh_2 = BlockHeader::unmarshal_cbor(h2)?;
+
+        // (1) check conditions necessary to any consensus fault
+
+        if bh_1.miner_address() != bh_2.miner_address() {
+            return Err(format!(
+                "no consensus fault: blocks not mined by same miner: {:?}, {:?}",
+                bh_1.miner_address(),
+                bh_2.miner_address()
+            )
+            .into());
+        };
+        // block a must be earlier or equal to block b, epoch wise (ie at least as early in the chain).
+        if bh_1.epoch() < bh_2.epoch() {
+            return Err(format!(
+                "first block must not be of higher height than second: {:?}, {:?}",
+                bh_1.epoch(),
+                bh_2.epoch()
+            )
+            .into());
+        };
+        let mut cf: Option<ConsensusFault> = None;
+        // (a) double-fork mining fault
+        if bh_1.epoch() == bh_2.epoch() {
+            cf = Some(ConsensusFault {
+                target: *bh_1.miner_address(),
+                epoch: bh_2.epoch(),
+                fault_type: ConsensusFaultType::DoubleForkMining,
+            })
+        };
+        // (b) time-offset mining fault
+        // strictly speaking no need to compare heights based on double fork mining check above,
+        // but at same height this would be a different fault.
+        if bh_1.parents() != bh_2.parents() && bh_1.epoch() != bh_2.epoch() {
+            cf = Some(ConsensusFault {
+                target: *bh_1.miner_address(),
+                epoch: bh_2.epoch(),
+                fault_type: ConsensusFaultType::TimeOffsetMining,
+            })
+        };
+        // (c) parent-grinding fault
+        // Here extra is the "witness", a third block that shows the connection between A and B as
+        // A's sibling and B's parent.
+        // Specifically, since A is of lower height, it must be that B was mined omitting A from its tipset
+        if !extra.is_empty() {
+            let bh_3 = BlockHeader::unmarshal_cbor(extra)?;
+            if bh_1.parents() != bh_3.parents()
+                && bh_1.epoch() != bh_3.epoch()
+                && bh_2.parents().cids().contains(bh_3.cid())
+                && !bh_2.parents().cids().contains(bh_1.cid())
+            {
+                cf = Some(ConsensusFault {
+                    target: *bh_1.miner_address(),
+                    epoch: bh_2.epoch(),
+                    fault_type: ConsensusFaultType::ParentGrinding,
+                })
+            }
+        };
+
+        // (3) return if no consensus fault by now
+        if cf.is_none() {
+            Ok(cf)
+        } else {
+            // (4) expensive final checks
+
+            // check blocks are properly signed by their respective miner
+            // note we do not need to check extra's: it is a parent to block b
+            // which itself is signed, so it was willingly included by the miner
+            self.verify_block_signature(&bh_1)?;
+            self.verify_block_signature(&bh_2)?;
+
+            Ok(cf)
+        }
+    }
+
+    fn batch_verify_seals(
+        &self,
+        vis: &[(Address, &Vec<SealVerifyInfo>)],
+    ) -> Result<HashMap<Address, Vec<bool>>, Box<dyn StdError>> {
+        // Gas charged for batch verify in actor
+
+        // TODO ideal to not use rayon https://github.com/ChainSafe/forest/issues/676
+        let out = vis
+            .par_iter()
+            .map(|(addr, seals)| {
+                let results = seals
+                    .par_iter()
+                    .map(|s| {
+                        if let Err(err) = V::verify_seal(s) {
+                            warn!(
+                                "seal verify in batch failed (miner: {}) (err: {})",
+                                addr, err
+                            );
+                            false
+                        } else {
+                            true
+                        }
+                    })
+                    .collect();
+                (*addr, results)
+            })
+            .collect();
+        Ok(out)
+    }
+}
+
 /// Shared logic between the DefaultRuntime and the Interpreter.
 /// It invokes methods on different Actors based on the Message.
-pub fn vm_send<'db, 'st, 'sys, 'r, 'act, BS, SYS, R, P>(
-    rt: &mut DefaultRuntime<'db, 'st, 'sys, 'r, 'act, BS, SYS, R, P>,
+pub fn vm_send<'db, 'vm, BS, R, V, P>(
+    rt: &mut DefaultRuntime<'db, 'vm, BS, R, V, P>,
     msg: &UnsignedMessage,
     gas_cost: Option<GasCharge>,
 ) -> Result<Serialized, ActorError>
 where
     BS: BlockStore,
-    SYS: Syscalls,
+    V: ProofVerifier,
     P: NetworkParams,
     R: Rand,
 {
@@ -643,7 +849,7 @@ where
     let to_actor = match rt
         .state
         .get_actor(msg.to())
-        .map_err(|e| actor_error!(fatal("failed to get actor: {}", e)))?
+        .map_err(|e| e.downcast_fatal("failed to get actor"))?
     {
         Some(act) => act,
         None => {
@@ -683,11 +889,11 @@ fn transfer<BS: BlockStore>(
 
     let from_id = state
         .lookup_id(from)
-        .map_err(|e| actor_error!(fatal("failed to lookup from id for address: {}", e)))?
+        .map_err(|e| e.downcast_fatal("failed to lookup from id for address"))?
         .ok_or_else(|| actor_error!(fatal("Failed to lookup from id for address {}", from)))?;
     let to_id = state
         .lookup_id(to)
-        .map_err(|e| actor_error!(fatal("failed to lookup to id for address: {}", e)))?
+        .map_err(|e| e.downcast_fatal("failed to lookup to id for address"))?
         .ok_or_else(|| actor_error!(fatal("Failed to lookup to id for address {}", to)))?;
 
     if from_id == to_id {
@@ -701,7 +907,7 @@ fn transfer<BS: BlockStore>(
 
     let mut f = state
         .get_actor(&from_id)
-        .map_err(|e| actor_error!(fatal("failed to get actor: {}", e)))?
+        .map_err(|e| e.downcast_fatal("failed to get actor"))?
         .ok_or_else(|| {
             actor_error!(fatal(
                 "sender actor does not exist in state during transfer"
@@ -709,7 +915,7 @@ fn transfer<BS: BlockStore>(
         })?;
     let mut t = state
         .get_actor(&to_id)
-        .map_err(|e| actor_error!(fatal("failed to get actor: {}", e)))?
+        .map_err(|e| e.downcast_fatal("failed to get actor: {}"))?
         .ok_or_else(|| {
             actor_error!(fatal(
                 "receiver actor does not exist in state during transfer"
@@ -724,17 +930,17 @@ fn transfer<BS: BlockStore>(
 
     state
         .set_actor(from, f)
-        .map_err(|e| actor_error!(fatal("failed to set actor: {}", e)))?;
+        .map_err(|e| e.downcast_fatal("failed to set from actor"))?;
     state
         .set_actor(to, t)
-        .map_err(|e| actor_error!(fatal("failed to set actor: {}", e)))?;
+        .map_err(|e| e.downcast_fatal("failed to set to actor"))?;
 
     Ok(())
 }
 
 /// Calls actor code with method and parameters.
-fn invoke<'db, 'st, 'sys, 'r, 'act, BS, SYS, R, P>(
-    rt: &mut DefaultRuntime<'db, 'st, 'sys, 'r, 'act, BS, SYS, R, P>,
+fn invoke<'db, 'vm, BS, R, V, P>(
+    rt: &mut DefaultRuntime<'db, 'vm, BS, R, V, P>,
     code: Cid,
     method_num: MethodNum,
     params: &Serialized,
@@ -742,7 +948,7 @@ fn invoke<'db, 'st, 'sys, 'r, 'act, BS, SYS, R, P>(
 ) -> Result<Serialized, ActorError>
 where
     BS: BlockStore,
-    SYS: Syscalls,
+    V: ProofVerifier,
     P: NetworkParams,
     R: Rand,
 {
@@ -761,9 +967,6 @@ where
         x => {
             if rt.registered_actors.contains(&x) {
                 match x {
-                    x if x == *PUPPET_ACTOR_CODE_ID => {
-                        puppet::Actor.invoke_method(rt, method_num, params)
-                    }
                     x if x == *CHAOS_ACTOR_CODE_ID => {
                         chaos::Actor.invoke_method(rt, method_num, params)
                     }
@@ -799,7 +1002,7 @@ where
 
     let act = st
         .get_actor(&addr)
-        .map_err(|e| actor_error!(SysErrInternal; e))?
+        .map_err(|e| e.downcast_default(ExitCode::SysErrInternal, "Failed to get actor"))?
         .ok_or_else(|| actor_error!(SysErrInternal; "Failed to retrieve actor: {}", addr))?;
 
     if act.code != *ACCOUNT_ACTOR_CODE_ID {
@@ -810,13 +1013,7 @@ where
     }
     let acc_st: account::State = store
         .get(&act.state)
-        .map_err(|e| {
-            actor_error!(fatal(
-                "Failed to get account actor state for: {}, e: {}",
-                addr,
-                e
-            ))
-        })?
+        .map_err(|e| e.downcast_fatal(format!("Failed to get account actor state for: {}", addr)))?
         .ok_or_else(|| {
             actor_error!(fatal(
                 "Address was not found for an account actor: {}",

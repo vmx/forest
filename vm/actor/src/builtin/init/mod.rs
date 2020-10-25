@@ -7,7 +7,7 @@ mod types;
 pub use self::state::State;
 pub use self::types::*;
 use crate::{
-    make_map, MINER_ACTOR_CODE_ID, MULTISIG_ACTOR_CODE_ID, PAYCH_ACTOR_CODE_ID,
+    make_map, ActorDowncast, MINER_ACTOR_CODE_ID, MULTISIG_ACTOR_CODE_ID, PAYCH_ACTOR_CODE_ID,
     POWER_ACTOR_CODE_ID, SYSTEM_ACTOR_ADDR,
 };
 use address::Address;
@@ -18,7 +18,7 @@ use num_traits::FromPrimitive;
 use runtime::{ActorCode, Runtime};
 use vm::{actor_error, ActorError, ExitCode, MethodNum, Serialized, METHOD_CONSTRUCTOR};
 
-// * Updated to specs-actors commit: f4024efad09a66e32bfeef10a2845b2b35325297 (v0.9.3)
+// * Updated to specs-actors commit: 17d3c602059e5c48407fb3c34343da87e6ea6586 (v0.9.12)
 
 /// Init actor methods available
 #[derive(FromPrimitive)]
@@ -40,9 +40,9 @@ impl Actor {
         let sys_ref: &Address = &SYSTEM_ACTOR_ADDR;
         rt.validate_immediate_caller_is(std::iter::once(sys_ref))?;
         let mut empty_map = make_map::<_, ()>(rt.store());
-        let root = empty_map
-            .flush()
-            .map_err(|err| actor_error!(ErrIllegalState; "failed to construct state: {}", err))?;
+        let root = empty_map.flush().map_err(|err| {
+            err.downcast_default(ExitCode::ErrIllegalState, "failed to construct state")
+        })?;
 
         rt.create(&State::new(root, params.network_name))?;
 
@@ -76,7 +76,9 @@ impl Actor {
         // Store mapping of pubkey or actor address to actor ID
         let id_address: Address = rt.transaction(|s: &mut State, rt| {
             s.map_address_to_new_id(rt.store(), &robust_address)
-                .map_err(|e| actor_error!(ErrIllegalState; "failed to allocate ID address: {}", e))
+                .map_err(|e| {
+                    e.downcast_default(ExitCode::ErrIllegalState, "failed to allocate ID address")
+                })
         })?;
 
         // Create an empty actor

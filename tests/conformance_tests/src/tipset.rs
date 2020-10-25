@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0, MIT
 
 use super::*;
+use fil_types::verifier::FullVerifier;
+use num_bigint::ToBigInt;
 use state_manager::StateManager;
 use std::sync::Arc;
 
@@ -29,16 +31,23 @@ mod block_messages_json {
                 let mut secpk_messages = Vec::new();
                 let mut bls_messages = Vec::new();
                 for message in &m.messages {
-                    match ChainMessage::unmarshal_cbor(message).map_err(de::Error::custom)? {
-                        ChainMessage::Signed(s) => secpk_messages.push(s),
-                        ChainMessage::Unsigned(u) => bls_messages.push(u),
+                    let msg_decoded =
+                        UnsignedMessage::unmarshal_cbor(&message).map_err(de::Error::custom)?;
+                    match msg_decoded.from().protocol() {
+                        Protocol::Secp256k1 => secpk_messages.push(to_chain_msg(msg_decoded)),
+                        Protocol::BLS => bls_messages.push(to_chain_msg(msg_decoded)),
+                        _ => {
+                            // matching go runner to force failure (bad address)
+                            secpk_messages.push(to_chain_msg(msg_decoded.clone()));
+                            bls_messages.push(to_chain_msg(msg_decoded));
+                        }
                     }
                 }
+                bls_messages.append(&mut secpk_messages);
                 Ok(BlockMessages {
                     miner: m.miner_addr,
                     win_count: m.win_count,
-                    bls_messages,
-                    secpk_messages,
+                    messages: bls_messages,
                 })
             })
             .collect::<Result<Vec<BlockMessages>, _>>()?)
@@ -47,9 +56,8 @@ mod block_messages_json {
 
 #[derive(Debug, Deserialize)]
 pub struct TipsetVector {
-    pub epoch: ChainEpoch,
-    #[serde(with = "bigint_json")]
-    pub basefee: BigInt,
+    pub epoch_offset: ChainEpoch,
+    pub basefee: f64,
     #[serde(with = "block_messages_json")]
     pub blocks: Vec<BlockMessages>,
 }
@@ -57,7 +65,7 @@ pub struct TipsetVector {
 pub struct ExecuteTipsetResult {
     pub receipts_root: Cid,
     pub post_state_root: Cid,
-    pub _applied_messages: Vec<UnsignedMessage>,
+    pub _applied_messages: Vec<ChainMessage>,
     pub applied_results: Vec<ApplyRet>,
 }
 
@@ -66,19 +74,20 @@ pub fn execute_tipset(
     pre_root: &Cid,
     parent_epoch: ChainEpoch,
     tipset: &TipsetVector,
+    exec_epoch: ChainEpoch,
 ) -> Result<ExecuteTipsetResult, Box<dyn StdError>> {
     let sm = StateManager::new(bs);
     let mut _applied_messages = Vec::new();
     let mut applied_results = Vec::new();
-    let (post_state_root, receipts_root) = sm.apply_blocks(
+    let (post_state_root, receipts_root) = sm.apply_blocks::<_, FullVerifier, _>(
         parent_epoch,
         pre_root,
         &tipset.blocks,
-        tipset.epoch,
+        exec_epoch,
         &TestRand,
-        tipset.basefee.clone(),
-        Some(|_, msg, ret| {
-            _applied_messages.push(msg);
+        tipset.basefee.to_bigint().unwrap_or_default(),
+        Some(|_, msg: &ChainMessage, ret| {
+            _applied_messages.push(msg.clone());
             applied_results.push(ret);
             Ok(())
         }),

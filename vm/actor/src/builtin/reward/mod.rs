@@ -15,16 +15,20 @@ use crate::{
 };
 use fil_types::StoragePower;
 use ipld_blockstore::BlockStore;
-use num_bigint::bigint_ser::{BigIntDe, BigIntSer};
 use num_bigint::Sign;
+use num_bigint::{
+    bigint_ser::{BigIntDe, BigIntSer},
+    Integer,
+};
 use num_derive::FromPrimitive;
 use num_traits::FromPrimitive;
 use runtime::{ActorCode, Runtime};
 use vm::{
-    actor_error, ActorError, ExitCode, MethodNum, Serialized, METHOD_CONSTRUCTOR, METHOD_SEND,
+    actor_error, ActorError, ExitCode, MethodNum, Serialized, TokenAmount, METHOD_CONSTRUCTOR,
+    METHOD_SEND,
 };
 
-// * Updated to specs-actors commit: f4024efad09a66e32bfeef10a2845b2b35325297 (v0.9.3)
+// * Updated to specs-actors commit: 17d3c602059e5c48407fb3c34343da87e6ea6586 (v0.9.12)
 
 /// Reward actor methods available
 #[derive(FromPrimitive)]
@@ -100,9 +104,9 @@ impl Actor {
             .ok_or_else(|| actor_error!(ErrNotFound; "failed to resolve given owner address"))?;
 
         let total_reward = rt.transaction(|st: &mut State, rt| {
-            let mut block_reward =
-                (&st.this_epoch_reward * params.win_count) / EXPECTED_LEADERS_PER_EPOCH;
-            let mut total_reward = params.gas_reward.clone() + &block_reward;
+            let mut block_reward: TokenAmount = (&st.this_epoch_reward * params.win_count)
+                .div_floor(&TokenAmount::from(EXPECTED_LEADERS_PER_EPOCH));
+            let mut total_reward = &params.gas_reward + &block_reward;
             let curr_balance = rt.current_balance()?;
             if total_reward > curr_balance {
                 log::warn!(
@@ -112,7 +116,7 @@ impl Actor {
                     total_reward
                 );
                 total_reward = curr_balance;
-                block_reward -= &params.gas_reward;
+                block_reward = &total_reward - &params.gas_reward;
                 assert_ne!(
                     block_reward.sign(),
                     Sign::Minus,
@@ -211,16 +215,18 @@ impl Actor {
         let curr_realized_power = curr_realized_power
             .ok_or_else(|| actor_error!(ErrIllegalArgument; "argument cannot be None"))?;
 
+        let network_version = rt.network_version();
+
         rt.transaction(|st: &mut State, rt| {
             let prev = st.epoch;
             // if there were null runs catch up the computation until
             // st.Epoch == rt.CurrEpoch()
             while st.epoch < rt.curr_epoch() {
                 // Update to next epoch to process null rounds
-                st.update_to_next_epoch(&curr_realized_power);
+                st.update_to_next_epoch(&curr_realized_power, network_version);
             }
 
-            st.update_to_next_epoch_with_reward(&curr_realized_power);
+            st.update_to_next_epoch_with_reward(&curr_realized_power, network_version);
             st.update_smoothed_estimates(st.epoch - prev);
             Ok(())
         })?;
