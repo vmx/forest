@@ -1,0 +1,3 @@
+(function() {var implementors = {};
+implementors["forest"] = [{"text":"impl StructOpt for AuthCommands","synthetic":false,"types":[]},{"text":"impl StructOpt for ChainCommands","synthetic":false,"types":[]},{"text":"impl StructOpt for FetchCommands","synthetic":false,"types":[]},{"text":"impl StructOpt for GenesisCommands","synthetic":false,"types":[]},{"text":"impl StructOpt for CLI","synthetic":false,"types":[]},{"text":"impl StructOpt for Subcommand","synthetic":false,"types":[]},{"text":"impl StructOpt for DaemonOpts","synthetic":false,"types":[]}];
+if (window.register_implementors) {window.register_implementors(implementors);} else {window.pending_implementors = implementors;}})()

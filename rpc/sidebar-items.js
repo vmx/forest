@@ -1,0 +1,1 @@
+initSidebarItems({"fn":[["start_rpc",""]],"struct":[["RpcState","This is where you store persistant data, or at least access to stateful data."]]});

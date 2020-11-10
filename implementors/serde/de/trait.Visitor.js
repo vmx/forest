@@ -1,0 +1,3 @@
+(function() {var implementors = {};
+implementors["forest_json_utils"] = [{"text":"impl&lt;'de, T, D&gt; Visitor&lt;'de&gt; for GoVecVisitor&lt;T, D&gt; <span class=\"where fmt-newline\">where<br>&nbsp;&nbsp;&nbsp;&nbsp;T: From&lt;D&gt;,<br>&nbsp;&nbsp;&nbsp;&nbsp;D: Deserialize&lt;'de&gt;,&nbsp;</span>","synthetic":false,"types":[]}];
+if (window.register_implementors) {window.register_implementors(implementors);} else {window.pending_implementors = implementors;}})()

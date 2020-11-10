@@ -1,0 +1,3 @@
+(function() {var implementors = {};
+implementors["forest_encoding"] = [{"text":"impl&lt;'a&gt; Serialize for BytesSer&lt;'a&gt;","synthetic":false,"types":[]},{"text":"impl Serialize for BytesDe","synthetic":false,"types":[]},{"text":"impl Serialize for Byte32De","synthetic":false,"types":[]}];
+if (window.register_implementors) {window.register_implementors(implementors);} else {window.pending_implementors = implementors;}})()

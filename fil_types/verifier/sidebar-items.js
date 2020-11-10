@@ -1,0 +1,1 @@
+initSidebarItems({"enum":[["FullVerifier","Verifier implementation"],["MockVerifier","Verifier implementation"]],"trait":[["ProofVerifier","Functionality for verification of seal, winning PoSt and window PoSt proofs. Proof verification will be full validation by default."]]});

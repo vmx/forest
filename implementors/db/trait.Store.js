@@ -1,0 +1,4 @@
+(function() {var implementors = {};
+implementors["db"] = [];
+implementors["ipld_blockstore"] = [{"text":"impl&lt;BS, '_&gt; Store for BufferedBlockStore&lt;'_, BS&gt; <span class=\"where fmt-newline\">where<br>&nbsp;&nbsp;&nbsp;&nbsp;BS: Store,&nbsp;</span>","synthetic":false,"types":[]},{"text":"impl&lt;BS, '_&gt; Store for TrackingBlockStore&lt;'_, BS&gt; <span class=\"where fmt-newline\">where<br>&nbsp;&nbsp;&nbsp;&nbsp;BS: Store,&nbsp;</span>","synthetic":false,"types":[]}];
+if (window.register_implementors) {window.register_implementors(implementors);} else {window.pending_implementors = implementors;}})()

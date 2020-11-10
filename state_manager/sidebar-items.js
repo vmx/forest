@@ -1,0 +1,1 @@
+initSidebarItems({"enum":[["Error","State manager error"]],"mod":[["utils",""]],"struct":[["InvocResult","Type to represent invocation of state call results"],["MarketBalance",""],["StateManager",""]],"type":[["CidPair","Intermediary for retrieving state objects and updating actor states"],["StateCallResult",""]]});

@@ -1,0 +1,13 @@
+(function() {var implementors = {};
+implementors["actor"] = [{"text":"impl Copy for DealState","synthetic":false,"types":[]},{"text":"impl Copy for TxnID","synthetic":false,"types":[]},{"text":"impl Copy for Merge","synthetic":false,"types":[]},{"text":"impl Copy for VestingFunction","synthetic":false,"types":[]}];
+implementors["chain_sync"] = [{"text":"impl Copy for SyncStage","synthetic":false,"types":[]}];
+implementors["fil_types"] = [{"text":"impl Copy for QuantSpec","synthetic":false,"types":[]},{"text":"impl Copy for DeadlineInfo","synthetic":false,"types":[]},{"text":"impl Copy for UnpaddedPieceSize","synthetic":false,"types":[]},{"text":"impl Copy for PaddedPieceSize","synthetic":false,"types":[]},{"text":"impl Copy for Randomness","synthetic":false,"types":[]},{"text":"impl Copy for RegisteredSealProof","synthetic":false,"types":[]},{"text":"impl Copy for RegisteredPoStProof","synthetic":false,"types":[]},{"text":"impl Copy for SectorSize","synthetic":false,"types":[]},{"text":"impl Copy for NetworkVersion","synthetic":false,"types":[]}];
+implementors["forest_address"] = [{"text":"impl Copy for Network","synthetic":false,"types":[]},{"text":"impl Copy for BLSPublicKey","synthetic":false,"types":[]},{"text":"impl Copy for Payload","synthetic":false,"types":[]},{"text":"impl Copy for Protocol","synthetic":false,"types":[]},{"text":"impl Copy for Address","synthetic":false,"types":[]}];
+implementors["forest_cid"] = [{"text":"impl Copy for Codec","synthetic":false,"types":[]},{"text":"impl Copy for Code","synthetic":false,"types":[]},{"text":"impl Copy for Version","synthetic":false,"types":[]},{"text":"impl Copy for Cid","synthetic":false,"types":[]}];
+implementors["forest_crypto"] = [{"text":"impl Copy for DomainSeparationTag","synthetic":false,"types":[]},{"text":"impl Copy for SignatureType","synthetic":false,"types":[]}];
+implementors["forest_ipld"] = [{"text":"impl Copy for VisitReason","synthetic":false,"types":[]},{"text":"impl Copy for RecursionLimit","synthetic":false,"types":[]},{"text":"impl Copy for Condition","synthetic":false,"types":[]}];
+implementors["forest_vm"] = [{"text":"impl Copy for ExitCode","synthetic":false,"types":[]}];
+implementors["ipld_amt"] = [{"text":"impl Copy for BitMap","synthetic":false,"types":[]}];
+implementors["ipld_blockstore"] = [{"text":"impl Copy for BSStats","synthetic":false,"types":[]}];
+implementors["runtime"] = [{"text":"impl Copy for ConsensusFaultType","synthetic":false,"types":[]}];
+if (window.register_implementors) {window.register_implementors(implementors);} else {window.pending_implementors = implementors;}})()

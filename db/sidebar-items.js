@@ -1,0 +1,1 @@
+initSidebarItems({"enum":[["Error","Database error"]],"struct":[["MemoryDB","A thread-safe `HashMap` wrapper."],["RocksDb",""],["WriteBatch","An atomic batch of write operations."]],"trait":[["DatabaseService",""],["Store","Store interface used as a KV store implementation"]]});

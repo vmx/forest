@@ -1,0 +1,1 @@
+initSidebarItems({"fn":[["deserialize",""],["serialize",""]],"struct":[["ActorStateJson","Wrapper for serializing and deserializing a SignedMessage from JSON."],["ActorStateJsonRef","Wrapper for serializing a SignedMessage reference to JSON."]]});

@@ -1,0 +1,3 @@
+(function() {var implementors = {};
+implementors["bitfield"] = [{"text":"impl&lt;I:&nbsp;RangeIterator&gt; Iterator for Skip&lt;I&gt;","synthetic":false,"types":[]},{"text":"impl&lt;I:&nbsp;RangeIterator&gt; Iterator for Take&lt;I&gt;","synthetic":false,"types":[]},{"text":"impl&lt;I&gt; Iterator for Ranges&lt;I&gt; <span class=\"where fmt-newline\">where<br>&nbsp;&nbsp;&nbsp;&nbsp;I: Iterator&lt;Item = Range&lt;usize&gt;&gt;,&nbsp;</span>","synthetic":false,"types":[]}];
+if (window.register_implementors) {window.register_implementors(implementors);} else {window.pending_implementors = implementors;}})()
